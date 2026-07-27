@@ -6,6 +6,7 @@ import { Payment } from "../types/payment";
 import { ref, get, set, update, remove } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { Customer } from "../types/customer";
+import { normalizeCurrency, toMoneyNumber } from "../utils/money";
 
 // ✅ جلب جميع الموردين
 export const getAll = async (_req: Request, res: Response) => {
@@ -110,10 +111,26 @@ export const updateSupplierInternal = async (
   const now = new Date().toLocaleString();
 
   if (sellUpdates) {
+    const remainingUSD = toMoneyNumber(
+      sellUpdates.remainingUSD,
+      toMoneyNumber(sellUpdates.remainingDebt),
+    );
+    const remainingSYP =
+      normalizeCurrency(sellUpdates.paymentCurrency || sellUpdates.currency) ===
+      "SYP"
+        ? toMoneyNumber(
+            sellUpdates.remainingSYP,
+            toMoneyNumber(sellUpdates.remainingOriginal),
+          )
+        : 0;
     const updatedSupplier: Supplier = {
       ...supplier,
       balance:
-        Number(supplier.balance || 0) + Number(sellUpdates.remainingDebt || 0),
+        toMoneyNumber(supplier.balance) + remainingUSD,
+      balanceUSD:
+        toMoneyNumber(supplier.balanceUSD, toMoneyNumber(supplier.balance)) +
+        remainingUSD,
+      balanceSYP: toMoneyNumber(supplier.balanceSYP) + remainingSYP,
       purchases: [...(supplier.purchases || []), sellUpdates.id || ""],
       updatedDate: now,
     };
@@ -122,10 +139,20 @@ export const updateSupplierInternal = async (
   }
 
   if (paymentUpdates) {
+    const amountUSD = toMoneyNumber(
+      paymentUpdates.amountUSD,
+      toMoneyNumber(paymentUpdates.amount),
+    );
     const updatedSupplier: Supplier = {
       ...supplier,
       balance:
-        Number(supplier.balance || 0) + Number(paymentUpdates.amount || 0),
+        toMoneyNumber(supplier.balance) + amountUSD,
+      balanceUSD:
+        toMoneyNumber(supplier.balanceUSD, toMoneyNumber(supplier.balance)) +
+        amountUSD,
+      balanceSYP:
+        toMoneyNumber(supplier.balanceSYP) +
+        toMoneyNumber(paymentUpdates.balanceSYPChange),
       updatedDate: now,
     };
     await set(supplierRef, updatedSupplier);
@@ -138,7 +165,8 @@ export const updateSupplierInternal = async (
 // تحديث الرصيد داخليًا
 export const updateSupplierBalanceInternal = async (
   id: string,
-  amountChange: number
+  amountChange: number,
+  amountSYPChange = 0,
 ): Promise<Supplier | null> => {
   const supplierRef = ref(database, `supplier/${id}`);
   const snapshot = await get(supplierRef);
@@ -147,7 +175,11 @@ export const updateSupplierBalanceInternal = async (
   const supplier = snapshot.val() as Supplier;
   const updatedSupplier: Supplier = {
     ...supplier,
-    balance: Number(supplier.balance || 0) + Number(amountChange),
+    balance: toMoneyNumber(supplier.balance) + toMoneyNumber(amountChange),
+    balanceUSD:
+      toMoneyNumber(supplier.balanceUSD, toMoneyNumber(supplier.balance)) +
+      toMoneyNumber(amountChange),
+    balanceSYP: toMoneyNumber(supplier.balanceSYP) + toMoneyNumber(amountSYPChange),
     updatedDate: new Date().toLocaleString(),
   };
 

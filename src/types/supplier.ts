@@ -3,6 +3,8 @@ export interface Supplier {
     name: string;
     number?: string;
     balance: number;
+    balanceUSD?: number;
+    balanceSYP?: number;
     defaultPaymentAccountId?: string;
     defaultPayableAccountId?: string;
     defaultInventoryAccountId?: string;

@@ -6,6 +6,7 @@ export interface CurrentUser {
   userId: string;
   username: string;
   role?: string;
+  permissions?: string[];
 }
 
 const getStringValue = (value: unknown) =>
@@ -22,6 +23,7 @@ export const getUserFromToken = (token?: string): CurrentUser | null => {
       userId?: string;
       username?: string;
       role?: string;
+      permissions?: unknown;
     };
 
     const username = getStringValue(payload.username || payload.userId || payload.sub);
@@ -33,6 +35,14 @@ export const getUserFromToken = (token?: string): CurrentUser | null => {
       userId: userId || username,
       username: username || userId,
       role: getStringValue(payload.role),
+      permissions: Array.isArray(payload.permissions)
+        ? payload.permissions
+            .filter(
+              (permission): permission is string =>
+                typeof permission === "string" && Boolean(permission.trim()),
+            )
+            .map((permission) => permission.trim())
+        : [],
     };
   } catch (error) {
     return null;
@@ -56,6 +66,12 @@ export const getCurrentUserFromRequest = (req: Request): CurrentUser | null => {
   const userId = getStringValue(
     req.headers["x-inventory-user-id"] || req.headers["x-user-id"] || username,
   );
+  const role = getStringValue(
+    req.headers["x-inventory-role"] || req.headers["x-user-role"],
+  );
+  const rawPermissions = getStringValue(
+    req.headers["x-inventory-permissions"] || req.headers["x-user-permissions"],
+  );
 
   if (!username && !userId) {
     return null;
@@ -64,6 +80,13 @@ export const getCurrentUserFromRequest = (req: Request): CurrentUser | null => {
   return {
     userId: userId || username,
     username: username || userId,
+    role,
+    permissions: rawPermissions
+      ? rawPermissions
+          .split(",")
+          .map((permission) => permission.trim())
+          .filter(Boolean)
+      : [],
   };
 };
 

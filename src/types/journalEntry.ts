@@ -4,6 +4,11 @@ export interface JournalEntryLine {
   accountName?: string;
   debit: number;
   credit: number;
+  currency?: "USD" | "SYP";
+  exchangeRate?: number;
+  amountUSD?: number;
+  amountSYP?: number;
+  amountOriginal?: number;
   note?: string;
 }
 

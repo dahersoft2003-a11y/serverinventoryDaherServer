@@ -2,10 +2,26 @@ import e, { Request, Response } from "express";
 import { Product } from "../types/product";
 import { ref, get, set, push, remove ,update } from "firebase/database";
 import { database } from "../firebaseConfig";
+import { getCurrentUserFromRequest } from "../utils/currentUser";
 
 let productsCache: any = null;
 let lastFetch = 0;
 let compareTime = 120_000
+
+const priceFields = [
+  "payPrice",
+  "wholesalePrice",
+  "superWholesalePrice",
+  "sellPrice",
+] as const;
+
+const fullPricingPermissions = new Set([
+  "sell-product",
+  "driver-sales",
+  "purchases",
+  "quotations",
+  "vehicles",
+]);
 
 const fetchReset = () => {
   lastFetch = Date.now() - compareTime;
@@ -22,6 +38,31 @@ const normalizeAlertQuantity = (value: unknown) => {
     : undefined;
 };
 
+const normalizePrice = (value: unknown) => {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) && numericValue >= 0
+    ? numericValue
+    : undefined;
+};
+
+const withNormalizedPriceFields = (product: Product): Product => {
+  const normalizedProduct: Product = { ...product };
+
+  priceFields.forEach((field) => {
+    const normalizedPrice = normalizePrice(product[field]);
+
+    if (normalizedPrice === undefined) {
+      delete normalizedProduct[field];
+    } else {
+      normalizedProduct[field] = normalizedPrice;
+    }
+  });
+
+  return normalizedProduct;
+};
+
 const withNormalizedAlertQuantity = (product: Product): Product => {
   const alertQuantity = normalizeAlertQuantity(product.alertQuantity);
   const normalizedProduct: Product = { ...product };
@@ -36,15 +77,45 @@ const withNormalizedAlertQuantity = (product: Product): Product => {
 };
 
 const withNormalizedStockFields = (product: Product): Product => ({
-  ...withNormalizedAlertQuantity(product),
+  ...withNormalizedPriceFields(withNormalizedAlertQuantity(product)),
   quantity: Number(product.quantity || 0),
   reservedQuantity: Number(product.reservedQuantity || 0),
 });
 
-export const getAll = async (_req: Request, res: Response) => {
+const stripRestrictedPriceFields = (product: any) => {
+  const sanitizedProduct = { ...product };
+
+  priceFields.forEach((field) => {
+    delete sanitizedProduct[field];
+  });
+
+  return sanitizedProduct;
+};
+
+const shouldHideRestrictedPrices = (req: Request) => {
+  const currentUser = getCurrentUserFromRequest(req);
+  const pricingMode = String(req.query.pricing || "full");
+
+  if (currentUser?.role === "admin") return false;
+
+  if (pricingMode === "table") return true;
+
+  const permissions = currentUser?.permissions || [];
+  const canSeeFullPricing = permissions.some((permission) =>
+    fullPricingPermissions.has(permission),
+  );
+
+  return !canSeeFullPricing;
+};
+
+export const getAll = async (req: Request, res: Response) => {
   try {
     if (productsCache && Date.now() - lastFetch < compareTime) {
-      return res.json(productsCache);
+      return res.json(
+        shouldHideRestrictedPrices(req)
+          ? productsCache.map(stripRestrictedPriceFields)
+          : productsCache,
+      );
     }
 
     const snapshot = await get(ref(database, "products"));
@@ -65,7 +136,11 @@ export const getAll = async (_req: Request, res: Response) => {
     productsCache = products;
     lastFetch = Date.now();
 
-    res.json(products);
+    res.json(
+      shouldHideRestrictedPrices(req)
+        ? products.map(stripRestrictedPriceFields)
+        : products,
+    );
   } catch (error) {
     console.error("❌ خطأ في جلب المنتجات:", error);
     res.status(500).json({ message: "حدث خطأ أثناء جلب المنتجات" });
@@ -159,6 +234,10 @@ export const getProductById = async (req: Request, res: Response) => {
           warehouse: matchedProduct?.warehouse || p.warehouse,
           quantity: matchedProduct?.quantity || p.quantity,
           payPrice: matchedProduct?.payPrice || p.payPrice,
+          wholesalePrice:
+            matchedProduct?.wholesalePrice || p.wholesalePrice,
+          superWholesalePrice:
+            matchedProduct?.superWholesalePrice || p.superWholesalePrice,
           totalPrice:
             matchedProduct?.lineTotal ||
             (matchedProduct
@@ -201,7 +280,32 @@ export const getProductById = async (req: Request, res: Response) => {
         };
       });
 
-    res.json({ product: foundProduct, purchases, sells, transfers });
+    const hideRestrictedPrices = shouldHideRestrictedPrices(req);
+    const productResponse = hideRestrictedPrices
+      ? stripRestrictedPriceFields(foundProduct)
+      : foundProduct;
+    const purchasesResponse = hideRestrictedPrices
+      ? purchases.map(
+          ({
+            payPrice,
+            wholesalePrice,
+            superWholesalePrice,
+            sellPrice,
+            totalPrice,
+            ...purchase
+          }: any) => purchase,
+        )
+      : purchases;
+    const sellsResponse = hideRestrictedPrices
+      ? sells.map(({ totalPrice, ...sell }: any) => sell)
+      : sells;
+
+    res.json({
+      product: productResponse,
+      purchases: purchasesResponse,
+      sells: sellsResponse,
+      transfers,
+    });
   } catch (error) {
     console.error("❌ خطأ في جلب المنتج:", error);
     res.status(500).json({ message: "حدث خطأ أثناء جلب المنتج" });
@@ -645,7 +749,11 @@ export const bulkUpdatePrices = async (req: Request, res: Response) => {
     }: {
       productIds: string[];
       percentageIncrease: number;
-      priceType: "sellPrice" | "payPrice";
+      priceType:
+        | "sellPrice"
+        | "payPrice"
+        | "wholesalePrice"
+        | "superWholesalePrice";
     } = req.body;
 
     if (!productIds?.length) {

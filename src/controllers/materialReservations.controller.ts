@@ -31,6 +31,57 @@ const toNumber = (value: unknown, fallback = 0) => {
   return Number.isFinite(next) ? next : fallback;
 };
 
+const hasSubmittedValue = (value: unknown) =>
+  value !== undefined && value !== null && String(value).trim() !== "";
+
+const calculateDiscount = (source: any, subtotal: number) => {
+  const discountPercent = toNumber(source.discountPercent);
+  const discountAmountUSD = hasSubmittedValue(source.discountAmountUSD)
+    ? toNumber(source.discountAmountUSD)
+    : hasSubmittedValue(source.discountAmount)
+      ? toNumber(source.discountAmount)
+      : hasSubmittedValue(source.discountPercent)
+        ? 0
+      : toNumber(source.discount);
+
+  if (discountPercent < 0 || discountPercent > 100) {
+    throw new Error("Invalid discount percent");
+  }
+
+  if (discountAmountUSD < 0) {
+    throw new Error("Invalid discount amount");
+  }
+
+  if (subtotal <= 0) {
+    if (discountPercent > 0 || discountAmountUSD > 0) {
+      throw new Error("Invalid discount");
+    }
+
+    return {
+      discount: 0,
+      discountPercent: 0,
+      discountPercentUSD: 0,
+      discountAmountUSD: 0,
+    };
+  }
+
+  const discountPercentUSD = Number(
+    (subtotal * (discountPercent / 100)).toFixed(3),
+  );
+  const discount = Number((discountPercentUSD + discountAmountUSD).toFixed(3));
+
+  if (discount >= subtotal) {
+    throw new Error("Invalid discount");
+  }
+
+  return {
+    discount,
+    discountPercent,
+    discountPercentUSD,
+    discountAmountUSD,
+  };
+};
+
 const nowIso = () => new Date().toISOString();
 
 const stripUndefined = <T>(value: T): T => {
@@ -116,6 +167,8 @@ const normalizeReservationItem = async (
     warehouse,
     unit: product.unit,
     payPrice: toNumber(product.payPrice),
+    wholesalePrice: toNumber(product.wholesalePrice),
+    superWholesalePrice: toNumber(product.superWholesalePrice),
     sellPrice: toNumber(rawItem.sellPrice, toNumber(product.sellPrice)),
     reservedQty,
   };
@@ -388,12 +441,12 @@ export const closeMaterialReservation = async (req: Request, res: Response) => {
       (sum, item) => sum + Number(item.lineTotal || 0),
       0,
     );
-    const discount = toNumber(sellPatch.discount);
-
-    if (discount < 0 || discount > totalBeforeDiscount) {
-      throw new Error("Invalid discount");
-    }
-
+    const {
+      discount,
+      discountPercent,
+      discountPercentUSD,
+      discountAmountUSD,
+    } = calculateDiscount(sellPatch, totalBeforeDiscount);
     const totalPrice = Number((totalBeforeDiscount - discount).toFixed(3));
     let sellData: sell | undefined;
 
@@ -449,6 +502,18 @@ export const closeMaterialReservation = async (req: Request, res: Response) => {
         exchangeRate,
         amount_base: totalPrice * exchangeRate,
         partValue,
+        subtotalUSD: totalBeforeDiscount,
+        discountType:
+          discountPercent > 0 && discountAmountUSD > 0
+            ? "mixed"
+            : discountPercent > 0
+              ? "percent"
+              : discountAmountUSD > 0
+                ? "amount"
+                : "none",
+        discountPercent,
+        discountPercentUSD,
+        discountAmountUSD,
         discount,
       };
 
@@ -492,6 +557,9 @@ export const closeMaterialReservation = async (req: Request, res: Response) => {
       ),
       totalPrice,
       discount,
+      discountPercent,
+      discountPercentUSD,
+      discountAmountUSD,
       closedAt,
       updatedAt: closedAt,
       updatedBy: getActorName(req),

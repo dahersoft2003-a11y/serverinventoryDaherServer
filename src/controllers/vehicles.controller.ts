@@ -24,6 +24,44 @@ const toNumber = (value: unknown, fallback = 0) => {
   return Number.isFinite(next) ? next : fallback;
 };
 
+const hasSubmittedValue = (value: unknown) =>
+  value !== undefined && value !== null && String(value).trim() !== "";
+
+const calculateDiscount = (source: any, subtotal: number) => {
+  const discountPercent = toNumber(source.discountPercent);
+  const discountAmountUSD = hasSubmittedValue(source.discountAmountUSD)
+    ? toNumber(source.discountAmountUSD)
+    : hasSubmittedValue(source.discountAmount)
+      ? toNumber(source.discountAmount)
+      : hasSubmittedValue(source.discountPercent)
+        ? 0
+      : toNumber(source.discount);
+
+  if (discountPercent < 0 || discountPercent > 100) {
+    throw new Error("Discount percent must be between 0 and 100");
+  }
+
+  if (discountAmountUSD < 0) {
+    throw new Error("Discount amount cannot be negative");
+  }
+
+  const discountPercentUSD = Number(
+    (subtotal * (discountPercent / 100)).toFixed(3),
+  );
+  const discount = Number((discountPercentUSD + discountAmountUSD).toFixed(3));
+
+  if (discount >= subtotal) {
+    throw new Error("Discount must be less than invoice subtotal");
+  }
+
+  return {
+    discount,
+    discountPercent,
+    discountPercentUSD,
+    discountAmountUSD,
+  };
+};
+
 const todayKey = () =>
   new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Damascus" });
 
@@ -91,6 +129,8 @@ const getProductsForWarehouse = async (warehouseName: string) => {
         quantity: toNumber(product.quantity),
         reservedQuantity: toNumber(product.reservedQuantity),
         payPrice: toNumber(product.payPrice),
+        wholesalePrice: toNumber(product.wholesalePrice),
+        superWholesalePrice: toNumber(product.superWholesalePrice),
         sellPrice: toNumber(product.sellPrice),
         warehouse: product.warehouse || warehouseName,
       }))
@@ -541,6 +581,9 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
         payPrice: toNumber(stockProduct.payPrice),
         quantity: toNumber(stockProduct.quantity),
         sellPrice: toNumber(rawProduct.sellPrice, toNumber(stockProduct.sellPrice)),
+        wholesalePrice: toNumber(stockProduct.wholesalePrice),
+        superWholesalePrice: toNumber(stockProduct.superWholesalePrice),
+        selectedPriceType: rawProduct.selectedPriceType || "custom",
         unit: stockProduct.unit || "",
         updatedDate: stockProduct.updatedDate || "",
         warehouse: vehicle.name,
@@ -552,7 +595,12 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
       (sum, product) => sum + product.qty * product.sellPrice,
       0,
     );
-    const discount = Math.max(toNumber(rawSell.discount), 0);
+    const {
+      discount,
+      discountPercent,
+      discountPercentUSD,
+      discountAmountUSD,
+    } = calculateDiscount(rawSell, subtotal);
     const totalPrice = Number((subtotal - discount).toFixed(3));
     const paymentStatus = ["cash", "part", "debt"].includes(
       String(rawSell.paymentStatus),
@@ -620,6 +668,18 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
       exchangeRate,
       amount_base: totalPrice * exchangeRate,
       partValue,
+      subtotalUSD: subtotal,
+      discountType:
+        discountPercent > 0 && discountAmountUSD > 0
+          ? "mixed"
+          : discountPercent > 0
+            ? "percent"
+            : discountAmountUSD > 0
+              ? "amount"
+              : "none",
+      discountPercent,
+      discountPercentUSD,
+      discountAmountUSD,
       discount,
       vehicleId: vehicle.id,
       vehicleName: vehicle.name,

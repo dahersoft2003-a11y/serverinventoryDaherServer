@@ -35,6 +35,10 @@ export interface Account {
 
   openingBalance: number;
   currentBalance: number;
+  openingBalanceUSD?: number;
+  openingBalanceSYP?: number;
+  currentBalanceUSD?: number;
+  currentBalanceSYP?: number;
 
   currency: string;
   description?: string;

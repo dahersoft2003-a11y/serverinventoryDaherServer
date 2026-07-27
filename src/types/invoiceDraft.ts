@@ -1,4 +1,4 @@
-import { Product } from "./product";
+import { Product, ProductPriceType } from "./product";
 
 export type InvoicePaymentStatus = "cash" | "part" | "debt";
 
@@ -6,6 +6,7 @@ export type InvoiceDraftProduct = Product & {
   productId?: string;
   qty: number;
   totalPrice?: number;
+  selectedPriceType?: ProductPriceType;
 };
 
 export interface InvoiceDraft {
@@ -14,6 +15,8 @@ export interface InvoiceDraft {
   customerId: string;
   products: InvoiceDraftProduct[];
   discount: string;
+  discountPercent?: string;
+  discountAmount?: string;
   paymentStatus: InvoicePaymentStatus;
   partValue: string;
   currency: string;

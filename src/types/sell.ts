@@ -1,3 +1,5 @@
+import type { ProductPriceType } from "./product";
+
 export interface sell {
   id?: string;
   customerId: string;
@@ -10,6 +12,25 @@ export interface sell {
   currency: string;
   exchangeRate: number;
   amount_base: number;
+  priceCurrency?: "USD";
+  paymentCurrency?: "USD" | "SYP";
+  subtotalUSD?: number;
+  totalUSD?: number;
+  totalSYP?: number;
+  totalOriginal?: number;
+  paidUSD?: number;
+  paidSYP?: number;
+  paidOriginal?: number;
+  remainingUSD?: number;
+  remainingSYP?: number;
+  remainingOriginal?: number;
+  discountType?: "none" | "amount" | "percent" | "mixed";
+  discountPercent?: number;
+  discountPercentUSD?: number;
+  discountAmountUSD?: number;
+  discountUSD?: number;
+  discountSYP?: number;
+  discountOriginal?: number;
   products: {
     category: string;
     code: string;
@@ -17,7 +38,10 @@ export interface sell {
     name: string;
     payPrice: number;
     quantity: number;
+    wholesalePrice?: number;
+    superWholesalePrice?: number;
     sellPrice: number;
+    selectedPriceType?: ProductPriceType;
     unit: string;
     updatedDate: string;
     warehouse: string;

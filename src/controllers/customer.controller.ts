@@ -5,6 +5,7 @@ import { sell } from "../types/sell";
 import { Payment } from "../types/payment";
 import { ref, get, set, update, remove } from "firebase/database";
 import { database } from "../firebaseConfig";
+import { normalizeCurrency, toMoneyNumber } from "../utils/money";
 
 /* =========================================================
    ✅ 1. جلب جميع العملاء
@@ -117,15 +118,42 @@ export const updateCustomerInternal = async (
   let updatedCustomer: Customer = { ...customer, updatedDate: now };
 
   if (sellUpdates) {
+    const remainingUSD = toMoneyNumber(
+      sellUpdates.remainingUSD,
+      toMoneyNumber(sellUpdates.remainingDebt),
+    );
+    const remainingSYP =
+      normalizeCurrency(sellUpdates.paymentCurrency || sellUpdates.currency) ===
+      "SYP"
+        ? toMoneyNumber(
+            sellUpdates.remainingSYP,
+            toMoneyNumber(sellUpdates.remainingOriginal),
+          )
+        : 0;
     updatedCustomer.balance =
-      (customer.balance || 0) - (sellUpdates.remainingDebt || 0);
+      toMoneyNumber(customer.balance) - remainingUSD;
+    updatedCustomer.balanceUSD =
+      toMoneyNumber(customer.balanceUSD, toMoneyNumber(customer.balance)) -
+      remainingUSD;
+    updatedCustomer.balanceSYP =
+      toMoneyNumber(customer.balanceSYP) - remainingSYP;
     updatedCustomer.purchases = [
       ...(customer.purchases || []),
       sellUpdates.id || "",
     ];
   } else if (payUpdates) {
+    const amountUSD = toMoneyNumber(
+      payUpdates.amountUSD,
+      toMoneyNumber(payUpdates.amount),
+    );
     updatedCustomer.balance =
-      (customer.balance || 0) + (payUpdates.amount || 0);
+      toMoneyNumber(customer.balance) + amountUSD;
+    updatedCustomer.balanceUSD =
+      toMoneyNumber(customer.balanceUSD, toMoneyNumber(customer.balance)) +
+      amountUSD;
+    updatedCustomer.balanceSYP =
+      toMoneyNumber(customer.balanceSYP) +
+      toMoneyNumber(payUpdates.balanceSYPChange);
   }
 
   await update(dbRef, updatedCustomer);
@@ -276,7 +304,8 @@ export const getCustomerById = async (req: Request, res: Response) => {
    ========================================================= */
 export const updateCustomerBalanceInternal = async (
   id: string,
-  amountChange: number
+  amountChange: number,
+  amountSYPChange = 0,
 ): Promise<Customer | null> => {
   const dbRef = ref(database, `customer/${id}`);
   const snapshot = await get(dbRef);
@@ -285,7 +314,11 @@ export const updateCustomerBalanceInternal = async (
   const customer = snapshot.val() as Customer;
   const updatedCustomer = {
     ...customer,
-    balance: (customer.balance || 0) + amountChange,
+    balance: toMoneyNumber(customer.balance) + toMoneyNumber(amountChange),
+    balanceUSD:
+      toMoneyNumber(customer.balanceUSD, toMoneyNumber(customer.balance)) +
+      toMoneyNumber(amountChange),
+    balanceSYP: toMoneyNumber(customer.balanceSYP) + toMoneyNumber(amountSYPChange),
     updatedDate: new Date().toLocaleString(),
   };
 

@@ -13,6 +13,77 @@ const toNumber = (value: unknown, fallback = 0) => {
   return Number.isFinite(next) ? next : fallback;
 };
 
+const hasSubmittedValue = (value: unknown) =>
+  value !== undefined && value !== null && String(value).trim() !== "";
+
+const calculateDiscount = (
+  rawQuotation: Partial<Quotation>,
+  previous: Quotation | null | undefined,
+  subtotal: number,
+) => {
+  const discountPercent = Math.max(
+    toNumber(rawQuotation.discountPercent ?? previous?.discountPercent),
+    0,
+  );
+  const hasStructuredDiscount =
+    hasSubmittedValue(rawQuotation.discountAmountUSD) ||
+    hasSubmittedValue(rawQuotation.discountPercent) ||
+    hasSubmittedValue(previous?.discountAmountUSD) ||
+    hasSubmittedValue(previous?.discountPercent);
+  const discountAmountUSD = Math.max(
+    hasStructuredDiscount
+      ? hasSubmittedValue(rawQuotation.discountAmountUSD)
+        ? toNumber(rawQuotation.discountAmountUSD)
+        : hasSubmittedValue(rawQuotation.discount)
+          ? toNumber(rawQuotation.discount)
+          : toNumber(previous?.discountAmountUSD)
+      : toNumber(rawQuotation.discount ?? previous?.discount),
+    0,
+  );
+
+  if (discountPercent > 100) {
+    throw new Error("Discount percent must be between 0 and 100");
+  }
+
+  if (subtotal <= 0) {
+    if (discountPercent > 0 || discountAmountUSD > 0) {
+      throw new Error("Discount must be less than quotation subtotal");
+    }
+
+    return {
+      discount: 0,
+      discountPercent: 0,
+      discountPercentUSD: 0,
+      discountAmountUSD: 0,
+      discountType: "none",
+    } as const;
+  }
+
+  const discountPercentUSD = Number(
+    (subtotal * (discountPercent / 100)).toFixed(3),
+  );
+  const discount = Number((discountPercentUSD + discountAmountUSD).toFixed(3));
+
+  if (discount >= subtotal) {
+    throw new Error("Discount must be less than quotation subtotal");
+  }
+
+  return {
+    discount,
+    discountPercent,
+    discountPercentUSD,
+    discountAmountUSD,
+    discountType:
+      discountPercent > 0 && discountAmountUSD > 0
+        ? "mixed"
+        : discountPercent > 0
+          ? "percent"
+          : discountAmountUSD > 0
+            ? "amount"
+            : "none",
+  } as const;
+};
+
 const nowIso = () => new Date().toISOString();
 
 const stripUndefined = <T>(value: T): T => {
@@ -65,7 +136,16 @@ const normalizeProduct = (product: any): QuotationProduct => ({
       : toNumber(product.reservedQuantity),
   qty: toNumber(product?.qty, 1),
   payPrice: product?.payPrice === undefined ? undefined : toNumber(product.payPrice),
+  wholesalePrice:
+    product?.wholesalePrice === undefined
+      ? undefined
+      : toNumber(product.wholesalePrice),
+  superWholesalePrice:
+    product?.superWholesalePrice === undefined
+      ? undefined
+      : toNumber(product.superWholesalePrice),
   sellPrice: toNumber(product?.sellPrice),
+  selectedPriceType: product?.selectedPriceType,
   unit: product?.unit ? String(product.unit) : undefined,
   updatedDate: product?.updatedDate ? String(product.updatedDate) : undefined,
   alertQuantity:
@@ -87,7 +167,8 @@ const normalizeQuotation = (
     (sum, product) => sum + toNumber(product.qty) * toNumber(product.sellPrice),
     0,
   );
-  const discount = Math.max(toNumber(rawQuotation.discount ?? previous?.discount), 0);
+  const discountDetails = calculateDiscount(rawQuotation, previous, subtotal);
+  const discount = discountDetails.discount;
   const totalPrice = Math.max(Number((subtotal - discount).toFixed(3)), 0);
   const now = nowIso();
 
@@ -110,6 +191,10 @@ const normalizeQuotation = (
     products,
     subtotal,
     discount,
+    discountType: discountDetails.discountType,
+    discountPercent: discountDetails.discountPercent,
+    discountPercentUSD: discountDetails.discountPercentUSD,
+    discountAmountUSD: discountDetails.discountAmountUSD,
     totalPrice,
     currency: String(rawQuotation.currency || previous?.currency || "USD"),
     exchangeRate: toNumber(

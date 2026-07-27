@@ -14,6 +14,22 @@ const toNumber = (value: unknown, fallback = 0) => {
   return Number.isFinite(next) ? next : fallback;
 };
 
+const normalizePriceType = (
+  value: unknown,
+): InvoiceDraftProduct["selectedPriceType"] => {
+  const next = String(value || "custom");
+
+  return [
+    "payPrice",
+    "wholesalePrice",
+    "superWholesalePrice",
+    "sellPrice",
+    "custom",
+  ].includes(next)
+    ? (next as NonNullable<InvoiceDraftProduct["selectedPriceType"]>)
+    : "custom";
+};
+
 const nowIso = () => new Date().toISOString();
 
 const stripUndefined = <T>(value: T): T => {
@@ -43,6 +59,8 @@ export const createEmptyInvoiceDraft = (userId: string): InvoiceDraft => ({
   customerId: "",
   products: [],
   discount: "",
+  discountPercent: "",
+  discountAmount: "",
   paymentStatus: "cash",
   partValue: "",
   currency: "",
@@ -61,7 +79,10 @@ const normalizeProduct = (product: Partial<InvoiceDraftProduct> | any) => ({
   code: String(product?.code || product?.productCode || ""),
   category: String(product?.category || ""),
   payPrice: toNumber(product?.payPrice),
+  wholesalePrice: toNumber(product?.wholesalePrice),
+  superWholesalePrice: toNumber(product?.superWholesalePrice),
   sellPrice: toNumber(product?.sellPrice),
+  selectedPriceType: normalizePriceType(product?.selectedPriceType),
   unit: String(product?.unit || ""),
   quantity: toNumber(product?.quantity),
   warehouse: String(product?.warehouse || ""),
@@ -93,6 +114,14 @@ const normalizeDraft = (
       rawDraft?.discount === undefined || rawDraft?.discount === null
         ? ""
         : String(rawDraft.discount),
+    discountPercent:
+      rawDraft?.discountPercent === undefined || rawDraft?.discountPercent === null
+        ? ""
+        : String(rawDraft.discountPercent),
+    discountAmount:
+      rawDraft?.discountAmount === undefined || rawDraft?.discountAmount === null
+        ? ""
+        : String(rawDraft.discountAmount),
     paymentStatus: ["cash", "part", "debt"].includes(paymentStatus)
       ? (paymentStatus as InvoiceDraft["paymentStatus"])
       : "cash",

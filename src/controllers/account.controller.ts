@@ -3,11 +3,54 @@ import { Request, Response } from "express";
 import { ref, get, set, update, remove } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { Account } from "../types/account";
+import { normalizeCurrency, roundMoney, toMoneyNumber } from "../utils/money";
 
 
 const getAccountNature = (type: string): "Debit" | "Credit" => {
   if (type === "Asset" || type === "Expense") return "Debit";
   return "Credit";
+};
+
+const applyBalanceChange = (
+  balance: number,
+  nature: "Debit" | "Credit",
+  entryType: "debit" | "credit",
+  amount: number,
+) => {
+  const shouldIncrease =
+    (nature === "Debit" && entryType === "debit") ||
+    (nature === "Credit" && entryType === "credit");
+
+  return roundMoney(shouldIncrease ? balance + amount : balance - amount);
+};
+
+export const normalizeAccountBalances = (account: Account): Account => {
+  const accountCurrency = normalizeCurrency(account.currency);
+  const openingBalance = toMoneyNumber(account.openingBalance);
+  const currentBalance = toMoneyNumber(account.currentBalance);
+  const currentBalanceUSD = toMoneyNumber(
+    account.currentBalanceUSD,
+    accountCurrency === "USD" ? currentBalance : 0,
+  );
+
+  return {
+    ...account,
+    currency: accountCurrency,
+    openingBalanceUSD: toMoneyNumber(
+      account.openingBalanceUSD,
+      accountCurrency === "USD" ? openingBalance : 0,
+    ),
+    openingBalanceSYP: toMoneyNumber(
+      account.openingBalanceSYP,
+      accountCurrency === "SYP" ? openingBalance : 0,
+    ),
+    currentBalance: currentBalanceUSD,
+    currentBalanceUSD,
+    currentBalanceSYP: toMoneyNumber(
+      account.currentBalanceSYP,
+      accountCurrency === "SYP" ? currentBalance : 0,
+    ),
+  };
 };
 
 
@@ -36,6 +79,7 @@ export const createAccount = async (req : Request , res : Response)=>{
     if (!type || !type.trim()) {
       return res.status(400).json({ error: "نوع الحساب مطلوب" });
     }
+    const accountCurrency = normalizeCurrency(currency);
         const numericOpeningBalance = Number(openingBalance || 0);
 
     if (isNaN(numericOpeningBalance)) {
@@ -53,9 +97,19 @@ export const createAccount = async (req : Request , res : Response)=>{
     if (isNaN(numeriCcurrentBalance)) {
       return res.status(400).json({ error: "الرصيد الافتتاحي يجب أن يكون رقماً" });
     }
+    const openingBalanceUSD =
+      accountCurrency === "USD" ? numericOpeningBalance : 0;
+    const openingBalanceSYP =
+      accountCurrency === "SYP" ? numericOpeningBalance : 0;
+    const currentBalanceUSD =
+      accountCurrency === "USD" ? numeriCcurrentBalance : 0;
+    const currentBalanceSYP =
+      accountCurrency === "SYP" ? numeriCcurrentBalance : 0;
    const dbRef = ref(database, "accounts");
     const snapshot = await get(dbRef);
-    const accounts = snapshot.exists() ? Object.values(snapshot.val()) : [];
+    const accounts = snapshot.exists()
+      ? (Object.values(snapshot.val()) as Account[]).map(normalizeAccountBalances)
+      : [];
 
     const existingCode = (accounts as any[]).find(
       (acc) => acc.code?.trim() === code.trim()
@@ -77,8 +131,12 @@ export const createAccount = async (req : Request , res : Response)=>{
       parentId: parentId || null,
       nature: getAccountNature(type),
       openingBalance: numericOpeningBalance,
-      currentBalance: numeriCcurrentBalance,
-      currency: currency || "USD",
+      currentBalance: currentBalanceUSD,
+      openingBalanceUSD,
+      openingBalanceSYP,
+      currentBalanceUSD,
+      currentBalanceSYP,
+      currency: accountCurrency,
       description: description?.trim() || "",
       isActive: true,
       isSystem: false,
@@ -122,6 +180,8 @@ export const updateAccount = async (req: Request, res: Response) => {
             category,
             parentId,
             currentBalance,
+            currentBalanceUSD,
+            currentBalanceSYP,
             currency,
             description,
             isActive,
@@ -157,9 +217,28 @@ export const updateAccount = async (req: Request, res: Response) => {
             }
         }
 
-        const numericCurrentBalance = currentBalance !== undefined ? Number(currentBalance) : currentAccount.currentBalance;
+        const nextCurrency = currency
+            ? normalizeCurrency(currency)
+            : normalizeCurrency(currentAccount.currency);
+        const submittedCurrentBalance =
+            currentBalance !== undefined ? Number(currentBalance) : undefined;
+        const numericCurrentBalanceUSD =
+            currentBalanceUSD !== undefined
+                ? Number(currentBalanceUSD)
+                : submittedCurrentBalance !== undefined && nextCurrency === "USD"
+                    ? submittedCurrentBalance
+                    : toMoneyNumber(
+                        currentAccount.currentBalanceUSD,
+                        toMoneyNumber(currentAccount.currentBalance),
+                      );
+        const numericCurrentBalanceSYP =
+            currentBalanceSYP !== undefined
+                ? Number(currentBalanceSYP)
+                : submittedCurrentBalance !== undefined && nextCurrency === "SYP"
+                    ? submittedCurrentBalance
+                    : toMoneyNumber(currentAccount.currentBalanceSYP);
 
-        if (isNaN(numericCurrentBalance)) {
+        if (isNaN(numericCurrentBalanceUSD) || isNaN(numericCurrentBalanceSYP)) {
             return res.status(400).json({ error: "الرصيد يجب أن يكون رقماً" });
         }
 
@@ -172,8 +251,10 @@ export const updateAccount = async (req: Request, res: Response) => {
             ...(type && { type: type.trim(), nature: getAccountNature(type) }),
             ...(category !== undefined && { category: category?.trim() || undefined }),
             ...(parentId !== undefined && { parentId: parentId || null }),
-            currentBalance: numericCurrentBalance,
-            ...(currency && { currency }),
+            currentBalance: numericCurrentBalanceUSD,
+            currentBalanceUSD: numericCurrentBalanceUSD,
+            currentBalanceSYP: numericCurrentBalanceSYP,
+            ...(currency && { currency: nextCurrency }),
             ...(description !== undefined && { description: description?.trim() || undefined }),
             ...(isActive !== undefined && { isActive }),
             ...(allowTransactions !== undefined && { allowTransactions }),
@@ -227,10 +308,17 @@ export const updateAccountBalanceInternal = async ({
   accountId,
   entryType,
   amount,
+  currency,
+  amountOriginal,
+  amountSYP,
 }: {
   accountId: string;
   entryType: "debit" | "credit";
   amount: number;
+  currency?: string;
+  exchangeRate?: number;
+  amountOriginal?: number;
+  amountSYP?: number;
 }): Promise<Account> => {
   const accountRef = ref(database, `accounts/${accountId}`);
   const snapshot = await get(accountRef);
@@ -239,7 +327,7 @@ export const updateAccountBalanceInternal = async ({
     throw new Error("الحساب غير موجود");
   }
 
-  const account: Account = snapshot.val();
+  const account: Account = normalizeAccountBalances(snapshot.val());
 
   if (!account.allowTransactions) {
     throw new Error("هذا الحساب لا يسمح بإجراء حركات عليه");
@@ -251,30 +339,50 @@ export const updateAccountBalanceInternal = async ({
     throw new Error("قيمة الحركة يجب أن تكون أكبر من صفر");
   }
 
-  let newBalance = account.currentBalance;
-
-  if (account.nature === "Debit") {
-    if (entryType === "debit") {
-      newBalance = account.currentBalance + numericAmount;
-    } else {
-      newBalance = account.currentBalance - numericAmount;
-    }
-  } else {
-    if (entryType === "credit") {
-      newBalance = account.currentBalance + numericAmount;
-    } else {
-      newBalance = account.currentBalance - numericAmount;
-    }
-  }
+  const movementCurrency = normalizeCurrency(currency || account.currency);
+  const numericAmountOriginal = Math.abs(
+    amountOriginal !== undefined
+      ? toMoneyNumber(amountOriginal)
+      : amountSYP !== undefined
+        ? toMoneyNumber(amountSYP)
+        : numericAmount,
+  );
+  const numericAmountSYP =
+    movementCurrency === "SYP"
+      ? Math.abs(
+          amountSYP !== undefined
+            ? toMoneyNumber(amountSYP)
+            : numericAmountOriginal,
+        )
+      : 0;
+  const newBalanceUSD = applyBalanceChange(
+    toMoneyNumber(account.currentBalanceUSD, toMoneyNumber(account.currentBalance)),
+    account.nature,
+    entryType,
+    numericAmount,
+  );
+  const newBalanceSYP =
+    movementCurrency === "SYP"
+      ? applyBalanceChange(
+          toMoneyNumber(account.currentBalanceSYP),
+          account.nature,
+          entryType,
+          numericAmountSYP,
+        )
+      : toMoneyNumber(account.currentBalanceSYP);
 
   const updatedAccount: Account = {
     ...account,
-    currentBalance: newBalance,
+    currentBalance: newBalanceUSD,
+    currentBalanceUSD: newBalanceUSD,
+    currentBalanceSYP: newBalanceSYP,
     updatedAt: new Date().toISOString(),
   };
 
   await update(accountRef, {
     currentBalance: updatedAccount.currentBalance,
+    currentBalanceUSD: updatedAccount.currentBalanceUSD,
+    currentBalanceSYP: updatedAccount.currentBalanceSYP,
     updatedAt: updatedAccount.updatedAt,
   });
 
@@ -309,7 +417,7 @@ export const getAccountDetails = async( req: Request , res : Response)=>{
       return res.status(404).json({ error: "الحساب غير موجود" });
     }
 
-    const account = accountSnapshot.val();
+    const account = normalizeAccountBalances(accountSnapshot.val());
 
     const [
       payments,

@@ -5,6 +5,36 @@ import { ref, get, set, push } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { updateAccountBalanceInternal } from "./account.controller";
 import { createJournalEntryInternal } from "./journalEntries.controller";
+import {
+  buildPaymentMoneyBreakdown,
+  normalizeCurrency,
+  toMoneyNumber,
+} from "../utils/money";
+
+const normalizePaymentForStorage = (paymentData: Payment): Payment => {
+  const paymentCurrency = normalizeCurrency(
+    paymentData.paymentCurrency || paymentData.currency,
+  );
+  const money = buildPaymentMoneyBreakdown({
+    amount: paymentData.amount,
+    amountUSD: paymentData.amountUSD,
+    currency: paymentCurrency,
+    exchangeRate: paymentData.exchangeRate,
+    amountOriginal: paymentData.amountOriginal ?? paymentData.amount_base,
+  });
+
+  return {
+    ...paymentData,
+    currency: paymentCurrency,
+    paymentCurrency,
+    exchangeRate: money.exchangeRate,
+    amount: money.amountUSD,
+    amount_base: money.amountBase,
+    amountUSD: money.amountUSD,
+    amountSYP: money.amountSYP,
+    amountOriginal: money.amountOriginal,
+  };
+};
 
 const normalizeStoredDate = (value: unknown) => {
   if (!value || typeof value !== "string") {
@@ -76,15 +106,30 @@ export const createPayment = async (req: Request, res: Response) => {
     const id = uuidv4();
     const now = new Date().toISOString();
 
-    const payment: Payment = {
+    const payment: Payment = normalizePaymentForStorage({
       ...newPayment,
       id,
       date: now,
-    };
+    });
 
     await set(ref(database, `payment/${id}`), payment);
 
-    const amount = Math.abs(Number(payment.amount || 0));
+    const amount = Math.abs(
+      toMoneyNumber(payment.amountUSD, toMoneyNumber(payment.amount)),
+    );
+    const paymentCurrency = normalizeCurrency(
+      payment.paymentCurrency || payment.currency,
+    );
+    const amountOriginal = Math.abs(
+      toMoneyNumber(
+        payment.amountOriginal,
+        toMoneyNumber(payment.amount_base, amount),
+      ),
+    );
+    const amountSYP =
+      paymentCurrency === "SYP"
+        ? Math.abs(toMoneyNumber(payment.amountSYP, amountOriginal))
+        : 0;
 
     if (
       payment.type === "income" &&
@@ -96,12 +141,20 @@ export const createPayment = async (req: Request, res: Response) => {
         accountId: payment.paymentAccountId,
         entryType: "debit",
         amount,
+        currency: paymentCurrency,
+        exchangeRate: payment.exchangeRate,
+        amountOriginal,
+        amountSYP,
       });
 
       await updateAccountBalanceInternal({
         accountId: payment.salesAccountId,
         entryType: "credit",
         amount,
+        currency: paymentCurrency,
+        exchangeRate: payment.exchangeRate,
+        amountOriginal,
+        amountSYP,
       });
     }
 
@@ -115,12 +168,20 @@ export const createPayment = async (req: Request, res: Response) => {
         accountId: payment.expenseAccountId,
         entryType: "debit",
         amount,
+        currency: paymentCurrency,
+        exchangeRate: payment.exchangeRate,
+        amountOriginal,
+        amountSYP,
       });
 
       await updateAccountBalanceInternal({
         accountId: payment.paymentAccountId,
         entryType: "credit",
         amount,
+        currency: paymentCurrency,
+        exchangeRate: payment.exchangeRate,
+        amountOriginal,
+        amountSYP,
       });
     }
 
@@ -140,12 +201,22 @@ export const createPayment = async (req: Request, res: Response) => {
             accountId: payment.paymentAccountId,
             debit: amount,
             credit: 0,
+            currency: paymentCurrency,
+            exchangeRate: payment.exchangeRate,
+            amountUSD: amount,
+            amountSYP,
+            amountOriginal,
             note: payment.note,
           },
           {
             accountId: payment.salesAccountId,
             debit: 0,
             credit: amount,
+            currency: paymentCurrency,
+            exchangeRate: payment.exchangeRate,
+            amountUSD: amount,
+            amountSYP,
+            amountOriginal,
             note: payment.note,
           },
         ],
@@ -168,12 +239,22 @@ export const createPayment = async (req: Request, res: Response) => {
             accountId: payment.expenseAccountId,
             debit: amount,
             credit: 0,
+            currency: paymentCurrency,
+            exchangeRate: payment.exchangeRate,
+            amountUSD: amount,
+            amountSYP,
+            amountOriginal,
             note: payment.note,
           },
           {
             accountId: payment.paymentAccountId,
             debit: 0,
             credit: amount,
+            currency: paymentCurrency,
+            exchangeRate: payment.exchangeRate,
+            amountUSD: amount,
+            amountSYP,
+            amountOriginal,
             note: payment.note,
           },
         ],
@@ -194,11 +275,11 @@ export const createPaymentInternal = async (
   const id = uuidv4();
   const now = new Date().toISOString();
 
-  const payment: Payment = {
+  const payment: Payment = normalizePaymentForStorage({
     ...newPayment,
     id,
     date: now,
-  };
+  });
 
   await set(ref(database, `payment/${id}`), payment);
   return payment;
