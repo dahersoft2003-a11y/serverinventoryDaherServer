@@ -15,6 +15,7 @@ export type AccountCategory =
   | "AccountsPayable"
   | "FixedAssets"
   | "Revenue"
+  | "SalesRevenue"
   | "CostOfGoodsSold"
   | "OperatingExpense"
   | "Equity"

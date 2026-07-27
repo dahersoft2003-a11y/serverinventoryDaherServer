@@ -1726,7 +1726,7 @@ export const handleCustomerReturnSafe = async (newReturn: {
     amount_base: -calculation.cashRefundOriginal,
   });
 
-  await postLedgerEntries([
+  const returnLedgerEntries: LedgerEntry[] = [
     {
       accountId: newReturn.salesAccountId,
       entryType: "debit",
@@ -1762,7 +1762,20 @@ export const handleCustomerReturnSafe = async (newReturn: {
       amountOriginal: calculation.receivableCreditOriginal,
       amountSYP: calculation.receivableCreditSYP,
     },
-  ]);
+  ];
+
+  await postLedgerEntries(returnLedgerEntries);
+
+  await createJournalEntryInternal({
+    date: new Date().toISOString(),
+    description: `Customer return for sell ${newReturn.referenceId}`,
+    referenceType: "customer-return",
+    referenceId: newReturn.referenceId,
+    lines: toJournalLines(
+      returnLedgerEntries,
+      `Customer return for sell ${newReturn.referenceId}`,
+    ),
+  });
 
   if (calculation.receivableCreditUSD > 0 || calculation.receivableCreditSYP > 0) {
     await updateCustomerBalanceInternal(

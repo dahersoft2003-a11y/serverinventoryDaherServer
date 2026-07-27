@@ -197,6 +197,60 @@ test("SYP partial return updates original and SYP amounts consistently", () => {
   assertMoney(result.updatedSell.remainingSYP, 450000);
 });
 
+test("SYP debt invoice return reduces receivable in both USD and SYP", () => {
+  const result = calculateSaleReturn({
+    sellData: makeSell({
+      currency: "SYP",
+      exchangeRate: 10000,
+      totalPrice: 100,
+      paidUSD: 0,
+      remainingDebt: 100,
+    }),
+    returnedProducts: [returnA(2)],
+    returnType: "debt",
+  });
+
+  assertMoney(result.returnValueUSD, 20);
+  assertMoney(result.receivableCreditUSD, 20);
+  assertMoney(result.receivableCreditSYP, 200000);
+  assertMoney(result.updatedSell.totalSYP, 800000);
+  assertMoney(result.updatedSell.remainingSYP, 800000);
+  assert.equal(result.updatedSell.paymentStatus, "debt");
+});
+
+test("partial invoice cannot refund more cash than was paid", () => {
+  assert.throws(
+    () =>
+      calculateSaleReturn({
+        sellData: makeSell({ totalPrice: 100, paidUSD: 10, remainingDebt: 90 }),
+        returnedProducts: [returnA(2)],
+        returnType: "cash",
+      }),
+    /greater than the amount paid/,
+  );
+});
+
+test("sequential returns keep invoice totals and quantities consistent", () => {
+  const first = calculateSaleReturn({
+    sellData: makeSell({ totalPrice: 100, paidUSD: 40, remainingDebt: 60 }),
+    returnedProducts: [returnA(2)],
+    returnType: "part",
+    partValueUSD: 5,
+  });
+
+  const second = calculateSaleReturn({
+    sellData: first.updatedSell,
+    returnedProducts: [returnA(3)],
+    returnType: "debt",
+  });
+
+  assertMoney(second.returnValueUSD, 30);
+  assertMoney(second.updatedSell.totalPrice, 50);
+  assertMoney(second.updatedSell.paidUSD, 35);
+  assertMoney(second.updatedSell.remainingDebt, 15);
+  assert.equal(second.updatedSell.products[0].qty, 5);
+});
+
 test("discounted invoices return the net discounted value, not gross line value", () => {
   const result = calculateSaleReturn({
     sellData: makeSell({

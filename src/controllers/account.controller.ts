@@ -24,6 +24,12 @@ const applyBalanceChange = (
   return roundMoney(shouldIncrease ? balance + amount : balance - amount);
 };
 
+const removeUndefinedValues = <T extends Record<string, any>>(value: T): T => {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
+  ) as T;
+};
+
 export const normalizeAccountBalances = (account: Account): Account => {
   const accountCurrency = normalizeCurrency(account.currency);
   const openingBalance = toMoneyNumber(account.openingBalance);
@@ -255,15 +261,17 @@ export const updateAccount = async (req: Request, res: Response) => {
             currentBalanceUSD: numericCurrentBalanceUSD,
             currentBalanceSYP: numericCurrentBalanceSYP,
             ...(currency && { currency: nextCurrency }),
-            ...(description !== undefined && { description: description?.trim() || undefined }),
+            ...(description !== undefined && { description: description?.trim() || "" }),
             ...(isActive !== undefined && { isActive }),
             ...(allowTransactions !== undefined && { allowTransactions }),
             updatedAt: now,
         };
 
-        await update(ref(database, `accounts/${id}`), updatedAccount);
+        const firebaseUpdate = removeUndefinedValues(updatedAccount);
 
-        res.status(200).json(updatedAccount);
+        await update(ref(database, `accounts/${id}`), firebaseUpdate);
+
+        res.status(200).json(firebaseUpdate);
     } catch (error: any) {
         console.error("Error updating account:", error);
         res.status(500).json({ error: "فشل في تحديث الحساب" });
