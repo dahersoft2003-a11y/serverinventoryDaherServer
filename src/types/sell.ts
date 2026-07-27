@@ -55,4 +55,5 @@ export interface sell {
   driverId?: string;
   driverName?: string;
   sourceWarehouse?: string;
+  updatedAt?: string;
 }

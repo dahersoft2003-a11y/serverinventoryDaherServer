@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node dist/server.js",
     "build": "tsc",
-    "dev": "nodemon src/server.ts"
+    "dev": "nodemon src/server.ts",
+    "test:return": "npm run build && node --test tests/saleReturn.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

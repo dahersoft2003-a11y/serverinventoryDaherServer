@@ -4,6 +4,10 @@ import { v4 as uuidv4 } from "uuid";
 import { sell } from "../types/sell";
 import { Payment } from "../types/payment";
 import { database } from "../firebaseConfig";
+import {
+  calculateSaleReturn,
+  CustomerReturnType,
+} from "../utils/saleReturn";
 
 // 🧩 جلب جميع فواتير البيع
 export const getAllSells = async (_req: Request, res: Response) => {
@@ -345,35 +349,40 @@ export const deleteSellById = async (req: Request, res: Response) => {
 
 export const returnProductsFromSellInternal = async (
   sellId: string,
-  returnedProducts: { code: string; warehouse: string; qty: number }[]
-): Promise<{ updatedSell: sell; totalRefund: number } | null> => {
+  returnedProducts: {
+    productId?: string;
+    code: string;
+    warehouse: string;
+    qty: number;
+  }[],
+  options: {
+    returnType?: CustomerReturnType;
+    partValueUSD?: number;
+  } = {}
+): Promise<{
+  updatedSell: sell;
+  totalRefund: number;
+  calculation: ReturnType<typeof calculateSaleReturn>;
+} | null> => {
   const sellRef = ref(database, `sells/${sellId}`);
   const sellSnap = await get(sellRef);
   if (!sellSnap.exists()) return null;
 
   const sellData: sell = sellSnap.val();
-  let totalRefund = 0;
+  const calculation = calculateSaleReturn({
+    sellData,
+    returnedProducts,
+    returnType: options.returnType || "debt",
+    partValueUSD: options.partValueUSD,
+  });
 
-  for (const { code, warehouse, qty } of returnedProducts) {
-    const product = sellData.products.find(
-      (p) => p.code === code && p.warehouse === warehouse
-    );
-    if (!product) continue;
+  await update(sellRef, calculation.updatedSell);
 
-    const returnedQty = Math.min(product.qty, qty);
-    product.qty -= returnedQty;
-    totalRefund += returnedQty * Number(product.sellPrice);
-  }
-
-  sellData.products = sellData.products.filter((p) => p.qty > 0);
-  sellData.totalPrice = sellData.products.reduce(
-    (sum, p) => sum + Number(p.sellPrice) * Number(p.qty),
-    0
-  );
-
-  await update(sellRef, sellData);
-
-  return { updatedSell: sellData, totalRefund };
+  return {
+    updatedSell: calculation.updatedSell,
+    totalRefund: calculation.returnValueUSD,
+    calculation,
+  };
 };
 
 

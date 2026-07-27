@@ -1,5 +1,5 @@
 import express, { Request, Response } from "express";
-import { customerPayment, handleBulkPurchase, handleCustomerReturn, handlePurchase, handleSell, handleSupplierReturn, supplierPayment, warehouseTransfer } from "../functions/transactions";
+import { customerPayment, handleBulkPurchase, handleCustomerReturnSafe, handlePurchase, handleSell, handleSupplierReturn, supplierPayment, warehouseTransfer } from "../functions/transactions";
 import { addAfterSellDiscountInternal } from "../controllers/sells.controller";
 import { updateCustomerBalanceInternal } from "../controllers/customer.controller";
 import { endExchange } from "../controllers/exchange.controller";
@@ -96,7 +96,7 @@ router.post("/CustomerReturn", async (req: Request, res: Response) => {
     if (!newReturn) {
       throw new Error("❌ بيانات الدفع غير مكتملة");
     }
-    const result = await handleCustomerReturn(newReturn);
+    const result = await handleCustomerReturnSafe(newReturn);
     res.json({ message: "✅ تمت عملية الدفع", data: result });
   } catch (error: any) {
     res.status(400).json({ message: error.message });

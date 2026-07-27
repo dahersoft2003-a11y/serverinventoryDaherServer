@@ -44,6 +44,11 @@ import {
   usdToOriginal,
   usdToSYPForPaymentCurrency,
 } from "../utils/money";
+import {
+  calculateSaleReturn,
+  CustomerReturnType,
+  SaleReturnLineInput,
+} from "../utils/saleReturn";
 
 type SellStockUpdater = (product: sell["products"][number]) => Promise<void>;
 
@@ -1383,6 +1388,13 @@ export const handleSupplierReturn = async (newReturn: {
 
 export const handleCustomerReturn = async (newReturn: {
   productCode: string;
+  products?: Array<{
+    productCode?: string;
+    code?: string;
+    productId?: string;
+    warehouse: string;
+    qty: number;
+  }>;
   customerId: string;
   warehouse: string;
   qty: number;
@@ -1571,6 +1583,205 @@ export const handleCustomerReturn = async (newReturn: {
   ]);
 
   return { success: true, message: "تمت عملية الإرجاع بنجاح" };
+};
+
+export const handleCustomerReturnSafe = async (newReturn: {
+  productCode?: string;
+  products?: Array<{
+    productCode?: string;
+    code?: string;
+    productId?: string;
+    warehouse: string;
+    qty: number;
+  }>;
+  customerId: string;
+  warehouse?: string;
+  qty?: number;
+  returnValue?: number;
+  referenceId: string;
+  productId?: string;
+  returnType: "debt" | "cash" | "part";
+  partValue?: number;
+  reason?: string;
+  paymentAccountId?: string;
+  receivableAccountId?: string;
+  salesAccountId?: string;
+}) => {
+  const returnType = (
+    ["cash", "debt", "part"].includes(String(newReturn.returnType))
+      ? newReturn.returnType
+      : "cash"
+  ) as CustomerReturnType;
+  const returnedProducts: SaleReturnLineInput[] = Array.isArray(newReturn.products)
+    ? newReturn.products.map((product) => ({
+        productId: product.productId,
+        code: product.code || product.productCode,
+        productCode: product.productCode || product.code,
+        warehouse: product.warehouse,
+        qty: product.qty,
+      }))
+    : [
+        {
+          productId: newReturn.productId,
+          code: newReturn.productCode,
+          productCode: newReturn.productCode,
+          warehouse: String(newReturn.warehouse || ""),
+          qty: Number(newReturn.qty || 0),
+        },
+      ];
+
+  const originalSellSnap = await get(
+    ref(database, `sells/${newReturn.referenceId}`),
+  );
+
+  if (!originalSellSnap.exists()) {
+    throw new Error("Sell invoice was not found");
+  }
+
+  const originalSell = originalSellSnap.val() as sell;
+  if (originalSell.customerId !== newReturn.customerId) {
+    throw new Error("Return customer does not match the sell invoice");
+  }
+
+  const calculation = calculateSaleReturn({
+    sellData: originalSell,
+    returnedProducts,
+    returnType,
+    partValueUSD: newReturn.partValue,
+  });
+
+  if (!newReturn.salesAccountId) {
+    throw new Error("Sales account is required for customer returns");
+  }
+
+  if (calculation.cashRefundUSD > 0 && !newReturn.paymentAccountId) {
+    throw new Error("Payment account is required for cash refunds");
+  }
+
+  if (calculation.receivableCreditUSD > 0 && !newReturn.receivableAccountId) {
+    throw new Error("Receivable account is required for debt return credits");
+  }
+
+  const assertAccountCanTransact = async (
+    accountId: string | undefined,
+    label: string,
+  ) => {
+    if (!accountId) return;
+
+    const accountSnapshot = await get(ref(database, `accounts/${accountId}`));
+    if (!accountSnapshot.exists()) {
+      throw new Error(`${label} account was not found`);
+    }
+
+    const account = accountSnapshot.val();
+    if (account?.allowTransactions === false) {
+      throw new Error(`${label} account does not allow transactions`);
+    }
+  };
+
+  await Promise.all([
+    assertAccountCanTransact(newReturn.salesAccountId, "Sales"),
+    calculation.cashRefundUSD > 0
+      ? assertAccountCanTransact(newReturn.paymentAccountId, "Payment")
+      : Promise.resolve(),
+    calculation.receivableCreditUSD > 0
+      ? assertAccountCanTransact(newReturn.receivableAccountId, "Receivable")
+      : Promise.resolve(),
+  ]);
+
+  const customerSnapshot = await get(
+    ref(database, `customer/${newReturn.customerId}`),
+  );
+  if (!customerSnapshot.exists()) {
+    throw new Error("Customer was not found");
+  }
+
+  for (const returnedLine of calculation.returnedLines) {
+    await createReturnInternal({
+      productCode: returnedLine.code,
+      productId: returnedLine.productId,
+      warehouse: returnedLine.warehouse,
+      qty: returnedLine.qty,
+      returnValue: returnedLine.netValueUSD,
+      type: "sale-return",
+      referenceId: newReturn.referenceId,
+      reason: newReturn.reason || "",
+    });
+  }
+
+  await createPaymentInternal({
+    type: "return",
+    customerId: newReturn.customerId,
+    paymentAccountId: newReturn.paymentAccountId,
+    receivableAccountId: newReturn.receivableAccountId,
+    salesAccountId: newReturn.salesAccountId,
+    amount: -calculation.cashRefundUSD,
+    amountUSD: -calculation.cashRefundUSD,
+    amountSYP: -calculation.cashRefundSYP,
+    amountOriginal: -calculation.cashRefundOriginal,
+    note: `Customer return (${calculation.returnedLines.length} product line)`,
+    currency: calculation.paymentCurrency,
+    paymentCurrency: calculation.paymentCurrency,
+    exchangeRate: calculation.exchangeRate,
+    amount_base: -calculation.cashRefundOriginal,
+  });
+
+  await postLedgerEntries([
+    {
+      accountId: newReturn.salesAccountId,
+      entryType: "debit",
+      amount: calculation.returnValueUSD,
+      currency: calculation.paymentCurrency,
+      exchangeRate: calculation.exchangeRate,
+      amountOriginal: usdToOriginal(
+        calculation.returnValueUSD,
+        calculation.paymentCurrency,
+        calculation.exchangeRate,
+      ),
+      amountSYP: usdToSYPForPaymentCurrency(
+        calculation.returnValueUSD,
+        calculation.paymentCurrency,
+        calculation.exchangeRate,
+      ),
+    },
+    {
+      accountId: newReturn.paymentAccountId,
+      entryType: "credit",
+      amount: calculation.cashRefundUSD,
+      currency: calculation.paymentCurrency,
+      exchangeRate: calculation.exchangeRate,
+      amountOriginal: calculation.cashRefundOriginal,
+      amountSYP: calculation.cashRefundSYP,
+    },
+    {
+      accountId: newReturn.receivableAccountId,
+      entryType: "credit",
+      amount: calculation.receivableCreditUSD,
+      currency: calculation.paymentCurrency,
+      exchangeRate: calculation.exchangeRate,
+      amountOriginal: calculation.receivableCreditOriginal,
+      amountSYP: calculation.receivableCreditSYP,
+    },
+  ]);
+
+  if (calculation.receivableCreditUSD > 0 || calculation.receivableCreditSYP > 0) {
+    await updateCustomerBalanceInternal(
+      newReturn.customerId,
+      calculation.receivableCreditUSD,
+      calculation.receivableCreditSYP,
+    );
+  }
+
+  await update(
+    ref(database, `sells/${newReturn.referenceId}`),
+    calculation.updatedSell,
+  );
+
+  return {
+    success: true,
+    message: "Customer return completed successfully",
+    data: calculation,
+  };
 };
 
 export const warehouseTransfer = async (transferData: {
