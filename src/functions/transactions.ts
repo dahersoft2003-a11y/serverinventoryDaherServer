@@ -86,6 +86,11 @@ const hasSubmittedValue = (value: unknown) => {
   return value !== undefined && value !== null && String(value).trim() !== "";
 };
 
+const stripUndefinedFields = <T extends Record<string, any>>(value: T): T =>
+  Object.fromEntries(
+    Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
+  ) as T;
+
 const getSubmittedDiscountAmount = (invoice: {
   discount?: unknown;
   discountAmountUSD?: unknown;
@@ -340,6 +345,25 @@ const postLedgerEntries = async (entries: LedgerEntry[]) => {
       amountOriginal: entry.amountOriginal,
       amountSYP: entry.amountSYP,
     });
+  }
+};
+
+const assertAccountCanTransact = async (
+  accountId: string | undefined,
+  label: string,
+) => {
+  if (!accountId) {
+    throw new Error(`${label} account is required`);
+  }
+
+  const accountSnapshot = await get(ref(database, `accounts/${accountId}`));
+  if (!accountSnapshot.exists()) {
+    throw new Error(`${label} account was not found`);
+  }
+
+  const account = accountSnapshot.val();
+  if (account?.allowTransactions === false) {
+    throw new Error(`${label} account does not allow transactions`);
   }
 };
 
@@ -1244,146 +1268,189 @@ export const handleSupplierReturn = async (newReturn: {
   payableAccountId?: string;
   paymentAccountId?: string;
 }) => {
-  try {
-    const returnQty = Math.abs(Number(newReturn.qty || 0));
+  const returnQty = Math.abs(Number(newReturn.qty || 0));
+  const returnType = normalizePaymentStatus(newReturn.returnType);
 
-    if (!returnQty) {
-      throw new Error("كمية الإرجاع غير صحيحة");
-    }
+  if (!returnQty) {
+    throw new Error("Return quantity must be greater than zero");
+  }
 
-    await createReturnInternal({
-      ...newReturn,
-      qty: returnQty,
-      type: "purchase-return",
-    });
+  if (returnType !== newReturn.returnType) {
+    throw new Error("Invalid supplier return type");
+  }
 
-    const purchaseData = await getPurchaseByIdInternal(newReturn.referenceId);
-    const returnCurrency = normalizeCurrency(
-      purchaseData?.paymentCurrency || purchaseData?.currency,
-    );
-    const returnExchangeRate = normalizeExchangeRate(
-      returnCurrency,
-      purchaseData?.exchangeRate,
-    );
+  const purchaseData = await getPurchaseByIdInternal(newReturn.referenceId);
+  if (!purchaseData) {
+    throw new Error("Purchase invoice was not found");
+  }
 
-    const paymentAmount =
-      newReturn.returnType === "cash"
-        ? newReturn.returnValue
-        : newReturn.returnType === "part"
-        ? newReturn.partValue
-        : 0;
-    const paymentOriginal = usdToOriginal(
-      paymentAmount,
-      returnCurrency,
-      returnExchangeRate,
-    );
+  if (purchaseData.supplierId !== newReturn.supplierId) {
+    throw new Error("Return supplier does not match the purchase invoice");
+  }
 
-    await createPaymentInternal({
-      type: "return",
-      supplierId: newReturn.supplierId,
-      paymentAccountId: newReturn.paymentAccountId,
-      payableAccountId: newReturn.payableAccountId,
-      amount: paymentAmount,
-      amountUSD: paymentAmount,
-      amountSYP: usdToSYPForPaymentCurrency(
-        paymentAmount,
-        returnCurrency,
-        returnExchangeRate,
-      ),
-      amountOriginal: paymentOriginal,
-      note: `اعادة منتجات للمورد (${newReturn.productCode})`,
-      currency: returnCurrency,
-      paymentCurrency: returnCurrency,
-      exchangeRate: returnExchangeRate,
-      amount_base: paymentOriginal,
-    });
+  if (returnQty > toFiniteNumber(purchaseData.quantity)) {
+    throw new Error("Return quantity is greater than purchase invoice quantity");
+  }
 
-    let balanceChange = 0;
-    if (newReturn.returnType === "debt") {
-      balanceChange = -newReturn.returnValue;
-    } else if (newReturn.returnType === "part") {
-      balanceChange = -(newReturn.returnValue - newReturn.partValue);
-    }
+  const returnValue = roundMoney(toFiniteNumber(newReturn.returnValue));
+  if (returnValue <= 0) {
+    throw new Error("Return value must be greater than zero");
+  }
 
-    const balanceSYPChange =
-      returnCurrency === "SYP"
-        ? usdToOriginal(balanceChange, returnCurrency, returnExchangeRate)
+  const paymentAmount =
+    returnType === "cash"
+      ? returnValue
+      : returnType === "part"
+        ? roundMoney(Math.max(toFiniteNumber(newReturn.partValue), 0))
         : 0;
 
-    await updateSupplierBalanceInternal(
-      newReturn.supplierId,
-      balanceChange,
-      balanceSYPChange,
-    );
+  if (returnType === "part" && (paymentAmount <= 0 || paymentAmount >= returnValue)) {
+    throw new Error("Partial supplier return amount must be greater than zero and less than return total");
+  }
 
-    const payableReturnAmount = Math.max(
-      newReturn.returnValue - paymentAmount,
-      0,
-    );
-    await postLedgerEntries([
-      {
-        accountId: newReturn.paymentAccountId,
-        entryType: "debit",
+  const payableReturnAmount = roundMoney(Math.max(returnValue - paymentAmount, 0));
+  await Promise.all([
+    assertAccountCanTransact(newReturn.inventoryAccountId, "Inventory"),
+    paymentAmount > 0
+      ? assertAccountCanTransact(newReturn.paymentAccountId, "Payment")
+      : Promise.resolve(),
+    payableReturnAmount > 0
+      ? assertAccountCanTransact(newReturn.payableAccountId, "Payable")
+      : Promise.resolve(),
+  ]);
+
+  const returnCurrency = normalizeCurrency(
+    purchaseData.paymentCurrency || purchaseData.currency,
+  );
+  const returnExchangeRate = normalizeExchangeRate(
+    returnCurrency,
+    purchaseData.exchangeRate,
+  );
+  const paymentOriginal = usdToOriginal(
+    paymentAmount,
+    returnCurrency,
+    returnExchangeRate,
+  );
+
+  await createReturnInternal({
+    ...newReturn,
+    qty: returnQty,
+    returnValue,
+    type: "purchase-return",
+  });
+
+  if (paymentAmount > 0) {
+    await createPaymentInternal(
+      stripUndefinedFields({
+        type: "return",
+        supplierId: newReturn.supplierId,
+        paymentAccountId: newReturn.paymentAccountId,
+        payableAccountId: newReturn.payableAccountId,
         amount: paymentAmount,
-        currency: returnCurrency,
-        exchangeRate: returnExchangeRate,
-        amountOriginal: paymentOriginal,
+        amountUSD: paymentAmount,
         amountSYP: usdToSYPForPaymentCurrency(
           paymentAmount,
           returnCurrency,
           returnExchangeRate,
         ),
-      },
-      {
-        accountId: newReturn.payableAccountId,
-        entryType: "debit",
-        amount: payableReturnAmount,
+        amountOriginal: paymentOriginal,
+        note: `Supplier return (${newReturn.productCode})`,
         currency: returnCurrency,
+        paymentCurrency: returnCurrency,
         exchangeRate: returnExchangeRate,
-        amountOriginal: usdToOriginal(
-          payableReturnAmount,
-          returnCurrency,
-          returnExchangeRate,
-        ),
-        amountSYP: usdToSYPForPaymentCurrency(
-          payableReturnAmount,
-          returnCurrency,
-          returnExchangeRate,
-        ),
-      },
-      {
-        accountId: newReturn.inventoryAccountId,
-        entryType: "credit",
-        amount: newReturn.returnValue,
-        currency: returnCurrency,
-        exchangeRate: returnExchangeRate,
-        amountOriginal: usdToOriginal(
-          newReturn.returnValue,
-          returnCurrency,
-          returnExchangeRate,
-        ),
-        amountSYP: usdToSYPForPaymentCurrency(
-          newReturn.returnValue,
-          returnCurrency,
-          returnExchangeRate,
-        ),
-      },
-    ]);
-
-    const updatedQuantity = Math.max(
-      Number(purchaseData?.quantity || 0) - returnQty,
-      0
+        amount_base: paymentOriginal,
+      }) as Payment,
     );
-
-    await updatePurchaseInternal(newReturn.referenceId, {
-      quantity: updatedQuantity,
-    });
-
-    return { success: true, message: "تمت عملية الإرجاع بنجاح" };
-  } catch (error) {
-    console.error("خطأ في عملية إرجاع المورد:", error);
-    return { success: false, message: "فشلت عملية الإرجاع", error };
   }
+
+  let balanceChange = 0;
+  if (returnType === "debt") {
+    balanceChange = -returnValue;
+  } else if (returnType === "part") {
+    balanceChange = -payableReturnAmount;
+  }
+
+  const balanceSYPChange =
+    returnCurrency === "SYP"
+      ? usdToOriginal(balanceChange, returnCurrency, returnExchangeRate)
+      : 0;
+
+  await updateSupplierBalanceInternal(
+    newReturn.supplierId,
+    balanceChange,
+    balanceSYPChange,
+  );
+
+  const supplierReturnLedgerEntries: LedgerEntry[] = [
+    {
+      accountId: newReturn.paymentAccountId,
+      entryType: "debit",
+      amount: paymentAmount,
+      currency: returnCurrency,
+      exchangeRate: returnExchangeRate,
+      amountOriginal: paymentOriginal,
+      amountSYP: usdToSYPForPaymentCurrency(
+        paymentAmount,
+        returnCurrency,
+        returnExchangeRate,
+      ),
+    },
+    {
+      accountId: newReturn.payableAccountId,
+      entryType: "debit",
+      amount: payableReturnAmount,
+      currency: returnCurrency,
+      exchangeRate: returnExchangeRate,
+      amountOriginal: usdToOriginal(
+        payableReturnAmount,
+        returnCurrency,
+        returnExchangeRate,
+      ),
+      amountSYP: usdToSYPForPaymentCurrency(
+        payableReturnAmount,
+        returnCurrency,
+        returnExchangeRate,
+      ),
+    },
+    {
+      accountId: newReturn.inventoryAccountId,
+      entryType: "credit",
+      amount: returnValue,
+      currency: returnCurrency,
+      exchangeRate: returnExchangeRate,
+      amountOriginal: usdToOriginal(
+        returnValue,
+        returnCurrency,
+        returnExchangeRate,
+      ),
+      amountSYP: usdToSYPForPaymentCurrency(
+        returnValue,
+        returnCurrency,
+        returnExchangeRate,
+      ),
+    },
+  ];
+
+  await postLedgerEntries(supplierReturnLedgerEntries);
+
+  await createJournalEntryInternal({
+    date: new Date().toISOString(),
+    description: `Supplier return for purchase ${newReturn.referenceId}`,
+    referenceType: "supplier-return",
+    referenceId: newReturn.referenceId,
+    lines: toJournalLines(
+      supplierReturnLedgerEntries,
+      `Supplier return for purchase ${newReturn.referenceId}`,
+    ),
+  });
+
+  const updatedQuantity = roundMoney(toFiniteNumber(purchaseData.quantity) - returnQty);
+
+  await updatePurchaseInternal(newReturn.referenceId, {
+    quantity: updatedQuantity,
+  });
+
+  return { success: true, message: "Supplier return completed successfully" };
 };
 
 export const handleCustomerReturn = async (newReturn: {
@@ -1460,7 +1527,8 @@ export const handleCustomerReturn = async (newReturn: {
     type: "sale-return",
   });
 
-  await createPaymentInternal({
+  if (refundedCash > 0) {
+    await createPaymentInternal(stripUndefinedFields({
     type: "return",
     customerId: newReturn.customerId,
     paymentAccountId: newReturn.paymentAccountId,
@@ -1484,7 +1552,8 @@ export const handleCustomerReturn = async (newReturn: {
     paymentCurrency: returnCurrency,
     exchangeRate: returnExchangeRate,
     amount_base: -refundedOriginal,
-  });
+    }) as Payment);
+  }
 
   const receivableReturnAmount = Math.max(returnValue - refundedCash, 0);
   await postLedgerEntries([
@@ -1709,22 +1778,26 @@ export const handleCustomerReturnSafe = async (newReturn: {
     });
   }
 
-  await createPaymentInternal({
-    type: "return",
-    customerId: newReturn.customerId,
-    paymentAccountId: newReturn.paymentAccountId,
-    receivableAccountId: newReturn.receivableAccountId,
-    salesAccountId: newReturn.salesAccountId,
-    amount: -calculation.cashRefundUSD,
-    amountUSD: -calculation.cashRefundUSD,
-    amountSYP: -calculation.cashRefundSYP,
-    amountOriginal: -calculation.cashRefundOriginal,
-    note: `Customer return (${calculation.returnedLines.length} product line)`,
-    currency: calculation.paymentCurrency,
-    paymentCurrency: calculation.paymentCurrency,
-    exchangeRate: calculation.exchangeRate,
-    amount_base: -calculation.cashRefundOriginal,
-  });
+  if (calculation.cashRefundUSD > 0) {
+    await createPaymentInternal(
+      stripUndefinedFields({
+        type: "return",
+        customerId: newReturn.customerId,
+        paymentAccountId: newReturn.paymentAccountId,
+        receivableAccountId: newReturn.receivableAccountId,
+        salesAccountId: newReturn.salesAccountId,
+        amount: -calculation.cashRefundUSD,
+        amountUSD: -calculation.cashRefundUSD,
+        amountSYP: -calculation.cashRefundSYP,
+        amountOriginal: -calculation.cashRefundOriginal,
+        note: `Customer return (${calculation.returnedLines.length} product line)`,
+        currency: calculation.paymentCurrency,
+        paymentCurrency: calculation.paymentCurrency,
+        exchangeRate: calculation.exchangeRate,
+        amount_base: -calculation.cashRefundOriginal,
+      }) as Payment,
+    );
+  }
 
   const returnLedgerEntries: LedgerEntry[] = [
     {
