@@ -7,7 +7,10 @@ import { handleSell } from "../functions/transactions";
 import { Product } from "../types/product";
 import { sell } from "../types/sell";
 import { Warehouse } from "../types/warehouse";
-import { getCurrentUserFromRequest } from "../utils/currentUser";
+import {
+  getCurrentUserFromRequest,
+  type CurrentUser,
+} from "../utils/currentUser";
 
 const WAREHOUSES_PATH = "warehouses";
 const PRODUCTS_PATH = "products";
@@ -19,6 +22,14 @@ type VehicleWarehouse = Warehouse & {
   type: "vehicle";
 };
 
+type UserVehicleRecord = {
+  id?: string;
+  _id?: string;
+  username?: string;
+  vehicleId?: string;
+  vehicleName?: string;
+};
+
 const toNumber = (value: unknown, fallback = 0) => {
   const next = Number(value);
   return Number.isFinite(next) ? next : fallback;
@@ -26,6 +37,25 @@ const toNumber = (value: unknown, fallback = 0) => {
 
 const hasSubmittedValue = (value: unknown) =>
   value !== undefined && value !== null && String(value).trim() !== "";
+
+const normalizeLookupValue = (value: unknown) => {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+  return String(value).trim();
+};
+
+const getLookupKeys = (...values: unknown[]) =>
+  Array.from(
+    new Set(
+      values
+        .map((value) => normalizeLookupValue(value).toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+
+const matchesLookupKey = (value: unknown, keys: string[]) => {
+  const lookupValue = normalizeLookupValue(value).toLowerCase();
+  return Boolean(lookupValue && keys.includes(lookupValue));
+};
 
 const calculateDiscount = (source: any, subtotal: number) => {
   const discountPercent = toNumber(source.discountPercent);
@@ -204,20 +234,61 @@ const requireAdmin = (req: Request, res: Response) => {
   return currentUser;
 };
 
-const getCurrentUserVehicle = async (req: Request) => {
-  const currentUser = getCurrentUserFromRequest(req);
-  if (!currentUser) return null;
+const getUserRecordForCurrentUser = async (
+  currentUser: CurrentUser,
+): Promise<UserVehicleRecord | null> => {
+  const directUserKeys = Array.from(
+    new Set(
+      [currentUser.userId, currentUser.username]
+        .map(normalizeLookupValue)
+        .filter(Boolean),
+    ),
+  );
 
-  const userSnapshot = await get(ref(database, `${USERS_PATH}/${currentUser.userId}`));
-  const userRecord = userSnapshot.exists() ? userSnapshot.val() : null;
+  for (const userKey of directUserKeys) {
+    const userSnapshot = await get(ref(database, `${USERS_PATH}/${userKey}`));
+    if (userSnapshot.exists()) return userSnapshot.val() as UserVehicleRecord;
+  }
+
+  const identityKeys = getLookupKeys(currentUser.userId, currentUser.username);
+  const usersSnapshot = await get(ref(database, USERS_PATH));
+  if (!usersSnapshot.exists()) return null;
+
+  const users = usersSnapshot.val() as Record<string, UserVehicleRecord>;
+  const matchingUser = Object.entries(users).find(
+    ([key, user]) =>
+      matchesLookupKey(key, identityKeys) ||
+      matchesLookupKey(user.id, identityKeys) ||
+      matchesLookupKey(user._id, identityKeys) ||
+      matchesLookupKey(user.username, identityKeys),
+  );
+
+  return matchingUser?.[1] || null;
+};
+
+const getCurrentUserVehicle = async (currentUser: CurrentUser) => {
+  const userRecord = await getUserRecordForCurrentUser(currentUser);
   const vehicles = await getVehicleWarehouses();
+  const identityKeys = getLookupKeys(
+    currentUser.userId,
+    currentUser.username,
+    userRecord?.id,
+    userRecord?._id,
+    userRecord?.username,
+  );
+  const vehicleIdKeys = getLookupKeys(userRecord?.vehicleId);
+  const vehicleNameKeys = getLookupKeys(userRecord?.vehicleName);
 
   return (
-    vehicles.find((vehicle) => vehicle.id === userRecord?.vehicleId) ||
     vehicles.find(
       (vehicle) =>
-        vehicle.driverId === currentUser.userId ||
-        vehicle.driverId === currentUser.username,
+        matchesLookupKey(vehicle.id, vehicleIdKeys) ||
+        matchesLookupKey(vehicle.name, vehicleNameKeys),
+    ) ||
+    vehicles.find(
+      (vehicle) =>
+        matchesLookupKey(vehicle.driverId, identityKeys) ||
+        matchesLookupKey(vehicle.driverName, identityKeys),
     ) ||
     null
   );
@@ -242,7 +313,12 @@ export const getAllVehicles = async (req: Request, res: Response) => {
 
 export const getMyVehicleDashboard = async (req: Request, res: Response) => {
   try {
-    const vehicle = await getCurrentUserVehicle(req);
+    const currentUser = getCurrentUserFromRequest(req);
+    if (!currentUser) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const vehicle = await getCurrentUserVehicle(currentUser);
 
     if (!vehicle) {
       return res.status(404).json({ message: "No vehicle assigned to this driver" });
@@ -542,7 +618,7 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const vehicle = await getCurrentUserVehicle(req);
+    const vehicle = await getCurrentUserVehicle(currentUser);
     if (!vehicle) {
       return res.status(404).json({ message: "No vehicle assigned to this driver" });
     }
