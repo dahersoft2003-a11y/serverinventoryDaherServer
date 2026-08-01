@@ -82,6 +82,23 @@ const withNormalizedStockFields = (product: Product): Product => ({
   reservedQuantity: Number(product.reservedQuantity || 0),
 });
 
+const normalizeProductRecord = (
+  productId: string,
+  warehouseName: string,
+  product: Partial<Product> | null | undefined,
+): Product => {
+  const normalizedProduct = product || {};
+
+  return {
+    ...normalizedProduct,
+    id: normalizedProduct.id || productId,
+    warehouse: normalizedProduct.warehouse || warehouseName,
+    category: normalizedProduct.category || "",
+    quantity: Number(normalizedProduct.quantity || 0),
+    reservedQuantity: Number(normalizedProduct.reservedQuantity || 0),
+  } as Product;
+};
+
 const stripRestrictedPriceFields = (product: any) => {
   const sanitizedProduct = { ...product };
 
@@ -121,14 +138,10 @@ export const getAll = async (req: Request, res: Response) => {
     const snapshot = await get(ref(database, "products"));
 
     const products = snapshot.exists()
-      ? Object.entries(snapshot.val()).flatMap(([categoryName, items]: any) =>
-          Object.entries(items).map(([id, product]: any) => ({
-            id,
-            category: categoryName,
-            ...product,
-            quantity: Number(product?.quantity || 0),
-            reservedQuantity: Number(product?.reservedQuantity || 0),
-          })),
+      ? Object.entries(snapshot.val()).flatMap(([warehouseName, items]: any) =>
+          Object.entries(items || {}).map(([id, product]: any) =>
+            normalizeProductRecord(id, warehouseName, product),
+          ),
         )
       : [];
 
@@ -606,6 +619,7 @@ export const deleteProduct = async (req: Request, res: Response) => {
       for (const productId in warehouses[warehouse]) {
         if (productId === id) {
           await remove(ref(database, `products/${warehouse}/${productId}`));
+          fetchReset();
           return res.json({ message: "تم حذف المنتج" });
         }
       }
@@ -662,6 +676,7 @@ export const createOrUpdateProductInternal = async (
           ref(database, `${warehousePath}/${productId}`),
           updatedProduct,
         );
+        fetchReset();
         return updatedProduct;
       }
     }
@@ -728,7 +743,9 @@ export const getByWarehouse = async (req: Request, res: Response) => {
     }
 
     const data = productsSnapshot.val();
-    const products = Object.values(data);
+    const products = Object.entries(data).map(([id, product]: any) =>
+      normalizeProductRecord(id, warehouse, product),
+    );
 
     res.json({ products });
   } catch (error) {

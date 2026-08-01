@@ -3,6 +3,7 @@ import { get, push, ref, set, update } from "firebase/database";
 import { v4 as uuidv4 } from "uuid";
 import { database } from "../firebaseConfig";
 import { createTransferInternal } from "./transfer.controller";
+import { resetProductsCache } from "./products.controller";
 import { handleSell } from "../functions/transactions";
 import { Product } from "../types/product";
 import { sell } from "../types/sell";
@@ -266,7 +267,7 @@ const getUserRecordForCurrentUser = async (
   return matchingUser?.[1] || null;
 };
 
-const getCurrentUserVehicle = async (currentUser: CurrentUser) => {
+const getCurrentUserVehicles = async (currentUser: CurrentUser) => {
   const userRecord = await getUserRecordForCurrentUser(currentUser);
   const vehicles = await getVehicleWarehouses();
   const identityKeys = getLookupKeys(
@@ -279,19 +280,43 @@ const getCurrentUserVehicle = async (currentUser: CurrentUser) => {
   const vehicleIdKeys = getLookupKeys(userRecord?.vehicleId);
   const vehicleNameKeys = getLookupKeys(userRecord?.vehicleName);
 
-  return (
-    vehicles.find(
-      (vehicle) =>
-        matchesLookupKey(vehicle.id, vehicleIdKeys) ||
-        matchesLookupKey(vehicle.name, vehicleNameKeys),
-    ) ||
-    vehicles.find(
-      (vehicle) =>
-        matchesLookupKey(vehicle.driverId, identityKeys) ||
-        matchesLookupKey(vehicle.driverName, identityKeys),
-    ) ||
-    null
+  const linkedVehicles = vehicles.filter(
+    (vehicle) =>
+      matchesLookupKey(vehicle.id, vehicleIdKeys) ||
+      matchesLookupKey(vehicle.name, vehicleNameKeys),
   );
+  const driverVehicles = vehicles.filter(
+    (vehicle) =>
+      matchesLookupKey(vehicle.driverId, identityKeys) ||
+      matchesLookupKey(vehicle.driverName, identityKeys),
+  );
+  const vehiclesById = new Map<string, VehicleWarehouse>();
+
+  [...linkedVehicles, ...driverVehicles].forEach((vehicle) => {
+    vehiclesById.set(vehicle.id || vehicle.name, vehicle);
+  });
+
+  return Array.from(vehiclesById.values());
+};
+
+const getCurrentUserVehicleSelection = async (
+  currentUser: CurrentUser,
+  ...requestedValues: unknown[]
+) => {
+  const vehicles = await getCurrentUserVehicles(currentUser);
+  const requestedKeys = getLookupKeys(...requestedValues);
+  const selectedVehicle = requestedKeys.length
+    ? vehicles.find(
+        (vehicle) =>
+          matchesLookupKey(vehicle.id, requestedKeys) ||
+          matchesLookupKey(vehicle.name, requestedKeys),
+      ) || null
+    : vehicles[0] || null;
+
+  return {
+    vehicle: selectedVehicle,
+    vehicles,
+  };
 };
 
 export const getAllVehicles = async (req: Request, res: Response) => {
@@ -318,14 +343,30 @@ export const getMyVehicleDashboard = async (req: Request, res: Response) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const vehicle = await getCurrentUserVehicle(currentUser);
+    const selection = await getCurrentUserVehicleSelection(
+      currentUser,
+      req.query.vehicleId,
+      req.query.vehicleName,
+    );
 
-    if (!vehicle) {
+    if (!selection.vehicles.length) {
       return res.status(404).json({ message: "No vehicle assigned to this driver" });
     }
 
+    if (!selection.vehicle) {
+      return res.status(403).json({ message: "Vehicle is not assigned to this driver" });
+    }
+
     const date = String(req.query.date || todayKey());
-    res.json({ data: await summarizeVehicle(vehicle, date) });
+    const summaries = await Promise.all(
+      selection.vehicles.map((vehicle) => summarizeVehicle(vehicle, date)),
+    );
+    const selectedSummary =
+      summaries.find(
+        (summary) => summary.vehicle.id === selection.vehicle?.id,
+      ) || summaries[0];
+
+    res.json({ data: selectedSummary, vehicles: summaries });
   } catch (error: any) {
     console.error("Error fetching driver vehicle:", error);
     res.status(500).json({ message: error.message || "Failed to fetch vehicle" });
@@ -580,6 +621,7 @@ export const loadVehicle = async (req: Request, res: Response) => {
     }
 
     await update(ref(database), rootUpdates);
+    resetProductsCache();
 
     await Promise.all(
       transferResults.map((transfer) =>
@@ -618,12 +660,23 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const vehicle = await getCurrentUserVehicle(currentUser);
-    if (!vehicle) {
+    const rawSell = req.body.newSell || req.body;
+    const selection = await getCurrentUserVehicleSelection(
+      currentUser,
+      rawSell.vehicleId,
+      rawSell.vehicleName,
+      rawSell.sourceWarehouse,
+    );
+
+    if (!selection.vehicles.length) {
       return res.status(404).json({ message: "No vehicle assigned to this driver" });
     }
 
-    const rawSell = req.body.newSell || req.body;
+    if (!selection.vehicle) {
+      return res.status(403).json({ message: "Vehicle is not assigned to this driver" });
+    }
+
+    const vehicle = selection.vehicle;
     const rawProducts = Array.isArray(rawSell.products) ? rawSell.products : [];
 
     if (!rawSell.customerId) {
