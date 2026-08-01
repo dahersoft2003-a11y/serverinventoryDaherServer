@@ -8,6 +8,7 @@ import {
   calculateSaleReturn,
   CustomerReturnType,
 } from "../utils/saleReturn";
+import { resolveProductsWarehouseKey } from "./products.controller";
 
 // 🧩 جلب جميع فواتير البيع
 export const getAllSells = async (_req: Request, res: Response) => {
@@ -140,7 +141,8 @@ export const updateSellById = async (req: Request, res: Response) => {
     for (const oldP of sellData.products || []) {
       if (!oldP?.warehouse || !oldP?.code || !oldP?.qty) continue;
 
-      const qtyPath = `products/${oldP.warehouse}/${oldP.id}/quantity`;
+      const oldWarehouseKey = await resolveProductsWarehouseKey(oldP.warehouse);
+      const qtyPath = `products/${oldWarehouseKey}/${oldP.id}/quantity`;
       const qtyRef = ref(database, qtyPath);
       const qtySnap = await get(qtyRef);
 
@@ -164,7 +166,8 @@ export const updateSellById = async (req: Request, res: Response) => {
         });
       }
 
-      const qtyPath = `products/${newP.warehouse}/${newP.id}/quantity`;
+      const newWarehouseKey = await resolveProductsWarehouseKey(newP.warehouse);
+      const qtyPath = `products/${newWarehouseKey}/${newP.id}/quantity`;
       const qtyRef = ref(database, qtyPath);
       const qtySnap = await get(qtyRef);
         
@@ -176,7 +179,7 @@ export const updateSellById = async (req: Request, res: Response) => {
 
       const currentQty = Number(qtySnap.val());
       const reservedSnap = await get(
-        ref(database, `products/${newP.warehouse}/${newP.id}/reservedQuantity`)
+        ref(database, `products/${newWarehouseKey}/${newP.id}/reservedQuantity`)
       );
       const reservedQty = Number(reservedSnap.exists() ? reservedSnap.val() : 0);
       const availableQty = currentQty - reservedQty;

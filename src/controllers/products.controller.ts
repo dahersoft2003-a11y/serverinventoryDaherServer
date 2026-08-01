@@ -82,6 +82,29 @@ const withNormalizedStockFields = (product: Product): Product => ({
   reservedQuantity: Number(product.reservedQuantity || 0),
 });
 
+const normalizeWarehouseName = (value: unknown) => String(value || "").trim();
+
+export const resolveProductsWarehouseKey = async (warehouseName: string) => {
+  const normalizedWarehouseName = normalizeWarehouseName(warehouseName);
+
+  if (!normalizedWarehouseName) return "";
+
+  const productsSnapshot = await get(ref(database, "products"));
+
+  if (!productsSnapshot.exists()) {
+    return normalizedWarehouseName;
+  }
+
+  const productsByWarehouse = productsSnapshot.val() as Record<string, unknown>;
+  const matchingKey = Object.keys(productsByWarehouse).find(
+    (warehouseKey) =>
+      normalizeWarehouseName(warehouseKey).toLowerCase() ===
+      normalizedWarehouseName.toLowerCase(),
+  );
+
+  return matchingKey || normalizedWarehouseName;
+};
+
 const normalizeProductRecord = (
   productId: string,
   warehouseName: string,
@@ -92,7 +115,9 @@ const normalizeProductRecord = (
   return {
     ...normalizedProduct,
     id: normalizedProduct.id || productId,
-    warehouse: normalizedProduct.warehouse || warehouseName,
+    warehouse: normalizeWarehouseName(
+      normalizedProduct.warehouse || warehouseName,
+    ),
     category: normalizedProduct.category || "",
     quantity: Number(normalizedProduct.quantity || 0),
     reservedQuantity: Number(normalizedProduct.reservedQuantity || 0),
@@ -329,16 +354,19 @@ export const create = async (req: Request, res: Response) => {
   try {
     const newProduct: Product = req.body;
 
-    if (!newProduct.warehouse)
+    const warehouseName = normalizeWarehouseName(newProduct.warehouse);
+
+    if (!warehouseName)
       return res.status(400).json({ message: "warehouse is required" });
 
     const NowDate = new Date().toLocaleString();
+    const warehouseKey = await resolveProductsWarehouseKey(warehouseName);
 
-    const warehouseRef = ref(database, `products/${newProduct.warehouse}`);
+    const warehouseRef = ref(database, `products/${warehouseKey}`);
     const newRef = push(warehouseRef);
 
     const productData: Product = {
-      ...withNormalizedStockFields(newProduct),
+      ...withNormalizedStockFields({ ...newProduct, warehouse: warehouseName }),
       id: newRef.key!,
       updatedDate: NowDate,
     };
@@ -363,7 +391,8 @@ export const updateQuantityOnSell = async (
   warehouse: string,
   soldQuantity: number,
 ): Promise<Product | null> => {
-  const productRef = ref(database, `products/${warehouse}/${productId}`);
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
   const snapshot = await get(productRef);
   if (!snapshot.exists()) return null;
 
@@ -393,7 +422,8 @@ export const assertProductAvailableForSellInternal = async (
   warehouse: string,
   soldQuantity: number,
 ) => {
-  const productRef = ref(database, `products/${warehouse}/${productId}`);
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
   const snapshot = await get(productRef);
 
   if (!snapshot.exists()) {
@@ -424,7 +454,8 @@ export const reserveProductQuantityInternal = async (
     throw new Error("Invalid reservation quantity");
   }
 
-  const productRef = ref(database, `products/${warehouse}/${productId}`);
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
   const snapshot = await get(productRef);
 
   if (!snapshot.exists()) {
@@ -465,7 +496,8 @@ export const releaseReservedQuantityInternal = async (
     throw new Error("Invalid reserved quantity release");
   }
 
-  const productRef = ref(database, `products/${warehouse}/${productId}`);
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
   const snapshot = await get(productRef);
 
   if (!snapshot.exists()) {
@@ -510,7 +542,8 @@ export const settleReservedQuantityOnSellInternal = async (
     throw new Error("Used quantity cannot exceed reserved quantity");
   }
 
-  const productRef = ref(database, `products/${warehouse}/${productId}`);
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
   const snapshot = await get(productRef);
 
   if (!snapshot.exists()) {
@@ -638,8 +671,14 @@ export const createOrUpdateProductInternal = async (
   newProduct: Product,
 ): Promise<Product> => {
   const NowDate = new Date().toLocaleString();
+  const warehouseName = normalizeWarehouseName(newProduct.warehouse);
 
-  const warehousePath = `products/${newProduct.warehouse}`;
+  if (!warehouseName) {
+    throw new Error("warehouse is required");
+  }
+
+  const warehouseKey = await resolveProductsWarehouseKey(warehouseName);
+  const warehousePath = `products/${warehouseKey}`;
   const warehouseRef = ref(database, warehousePath);
 
   // 1) قراءة كل المنتجات داخل نفس المستودع
@@ -658,6 +697,7 @@ export const createOrUpdateProductInternal = async (
         const updatedProduct: Product = {
           ...existingProduct,
           ...newProduct,
+          warehouse: warehouseName,
           quantity:
             Number(existingProduct.quantity || 0) +
             Number(newProduct.quantity || 0),
@@ -686,7 +726,7 @@ export const createOrUpdateProductInternal = async (
   const newRef = push(warehouseRef);
 
   const productToAdd: Product = {
-    ...withNormalizedStockFields(newProduct),
+    ...withNormalizedStockFields({ ...newProduct, warehouse: warehouseName }),
     updatedDate: NowDate,
     id: newRef.key!, // id هو مفتاح push في Firebase
   };
@@ -734,9 +774,10 @@ export const getProductByIdInternal = async (id: string) => {
 export const getByWarehouse = async (req: Request, res: Response) => {
   try {
     const { warehouse } = req.body;
+    const warehouseKey = await resolveProductsWarehouseKey(String(warehouse || ""));
     console.log(warehouse)
 
-    const productsSnapshot = await get(ref(database, `products/${warehouse}`));
+    const productsSnapshot = await get(ref(database, `products/${warehouseKey}`));
 
     if (!productsSnapshot.exists()) {
       return res.json({ products: [] });
@@ -744,7 +785,7 @@ export const getByWarehouse = async (req: Request, res: Response) => {
 
     const data = productsSnapshot.val();
     const products = Object.entries(data).map(([id, product]: any) =>
-      normalizeProductRecord(id, warehouse, product),
+      normalizeProductRecord(id, warehouseKey, product),
     );
 
     res.json({ products });

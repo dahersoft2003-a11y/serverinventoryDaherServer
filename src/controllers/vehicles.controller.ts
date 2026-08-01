@@ -3,7 +3,10 @@ import { get, push, ref, set, update } from "firebase/database";
 import { v4 as uuidv4 } from "uuid";
 import { database } from "../firebaseConfig";
 import { createTransferInternal } from "./transfer.controller";
-import { resetProductsCache } from "./products.controller";
+import {
+  resetProductsCache,
+  resolveProductsWarehouseKey,
+} from "./products.controller";
 import { handleSell } from "../functions/transactions";
 import { Product } from "../types/product";
 import { sell } from "../types/sell";
@@ -515,9 +518,15 @@ export const loadVehicle = async (req: Request, res: Response) => {
     const sourceWarehouse = String(req.body.sourceWarehouse || "").trim();
     const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
 
-    if (!sourceWarehouse || sourceWarehouse === vehicle.name) {
+    if (
+      !sourceWarehouse ||
+      normalizeLookupValue(sourceWarehouse).toLowerCase() ===
+        normalizeLookupValue(vehicle.name).toLowerCase()
+    ) {
       return res.status(400).json({ message: "Valid source warehouse is required" });
     }
+
+    const sourceWarehouseKey = await resolveProductsWarehouseKey(sourceWarehouse);
 
     if (!rawItems.length) {
       return res.status(400).json({ message: "At least one product is required" });
@@ -560,7 +569,7 @@ export const loadVehicle = async (req: Request, res: Response) => {
     for (const item of items) {
       const { productId, quantity } = item;
 
-      const sourceRef = ref(database, `${PRODUCTS_PATH}/${sourceWarehouse}/${productId}`);
+      const sourceRef = ref(database, `${PRODUCTS_PATH}/${sourceWarehouseKey}/${productId}`);
       const sourceSnapshot = await get(sourceRef);
 
       if (!sourceSnapshot.exists()) {
@@ -601,10 +610,10 @@ export const loadVehicle = async (req: Request, res: Response) => {
       };
 
       rootUpdates[
-        `${PRODUCTS_PATH}/${sourceWarehouse}/${productId}/quantity`
+        `${PRODUCTS_PATH}/${sourceWarehouseKey}/${productId}/quantity`
       ] = sourceQuantity - quantity;
       rootUpdates[
-        `${PRODUCTS_PATH}/${sourceWarehouse}/${productId}/updatedDate`
+        `${PRODUCTS_PATH}/${sourceWarehouseKey}/${productId}/updatedDate`
       ] = now;
       rootUpdates[`${PRODUCTS_PATH}/${vehicle.name}/${targetProductId}`] =
         nextTargetProduct;

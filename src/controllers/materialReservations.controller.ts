@@ -6,6 +6,7 @@ import { handleSell } from "../functions/transactions";
 import {
   releaseReservedQuantityInternal,
   reserveProductQuantityInternal,
+  resolveProductsWarehouseKey,
   settleReservedQuantityOnSellInternal,
 } from "./products.controller";
 import {
@@ -114,7 +115,8 @@ const getActorName = (req: Request) => {
 };
 
 const getProduct = async (productId: string, warehouse: string) => {
-  const productSnapshot = await get(ref(database, `products/${warehouse}/${productId}`));
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+  const productSnapshot = await get(ref(database, `products/${warehouseKey}/${productId}`));
 
   if (!productSnapshot.exists()) {
     throw new Error("Product not found");

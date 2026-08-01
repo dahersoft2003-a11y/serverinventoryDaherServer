@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { getDatabase, ref, get, set, update } from "firebase/database";
 import { v4 as uuidv4 } from "uuid";
+import { resolveProductsWarehouseKey } from "./products.controller";
 
 export interface ReturnData {
   productCode: string;
@@ -87,7 +88,8 @@ export const createReturn = async (req: Request, res: Response) => {
 
   try {
     const db = getDatabase();
-    const productRef = ref(db, `products/${warehouse}/${productCode}`);
+    const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+    const productRef = ref(db, `products/${warehouseKey}/${productCode}`);
     const productSnap = await get(productRef);
 
     if (!productSnap.exists()) {
@@ -137,9 +139,10 @@ export const createReturn = async (req: Request, res: Response) => {
 export const createReturnInternal = async (newReturn: ReturnData) => {
   try {
     const db = getDatabase();
+    const warehouseKey = await resolveProductsWarehouseKey(newReturn.warehouse);
     const productRef = ref(
       db,
-      `products/${newReturn.warehouse}/${newReturn.productId}`
+      `products/${warehouseKey}/${newReturn.productId}`
     );
     const productSnap = await get(productRef);
 
