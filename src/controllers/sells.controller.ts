@@ -8,6 +8,7 @@ import {
   calculateSaleReturn,
   CustomerReturnType,
 } from "../utils/saleReturn";
+import { reconcileCustomerBalanceInternal } from "./customer.controller";
 import { resolveProductsWarehouseKey } from "./products.controller";
 
 const stripUndefined = <T>(value: T): T => {
@@ -278,6 +279,7 @@ export const updateSellById = async (req: Request, res: Response) => {
     // =========================
 
     await update(sellRef, sellData);
+    await reconcileCustomerBalanceInternal(sellData.customerId);
 
     return res.json({
       message: "✅ تم تحديث الفاتورة بنجاح",
@@ -333,16 +335,6 @@ export const deleteSellById = async (req: Request, res: Response) => {
 
     await update(ref(database, "products"), products);
 
-    // 💰 تعديل رصيد الزبون
-    const customerRef = ref(database, `customer/${sellData.customerId}`);
-    const customerSnap = await get(customerRef);
-    if (customerSnap.exists()) {
-      const customer = customerSnap.val();
-      customer.balance =
-        Number(customer.balance || 0) + Number(sellData.remainingDebt || 0);
-      await update(customerRef, customer);
-    }
-
     // 🧾 تسجيل العملية كدفعة حذف
     const paymentId = uuidv4();
     const payment: Payment = {
@@ -361,6 +353,7 @@ export const deleteSellById = async (req: Request, res: Response) => {
 
     // حذف الفاتورة
     await remove(sellRef);
+    await reconcileCustomerBalanceInternal(sellData.customerId);
 
     res.json({
       message: `✅ تم حذف الفاتورة ${id} وإرجاع المخزون وتحديث رصيد الزبون.`,
@@ -401,6 +394,7 @@ export const returnProductsFromSellInternal = async (
   });
 
   await update(sellRef, calculation.updatedSell);
+  await reconcileCustomerBalanceInternal(sellData.customerId);
 
   return {
     updatedSell: calculation.updatedSell,

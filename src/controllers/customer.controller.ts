@@ -5,7 +5,154 @@ import { sell } from "../types/sell";
 import { Payment } from "../types/payment";
 import { ref, get, set, update, remove } from "firebase/database";
 import { database } from "../firebaseConfig";
-import { normalizeCurrency, toMoneyNumber } from "../utils/money";
+import { normalizeCurrency, roundMoney, toMoneyNumber } from "../utils/money";
+
+type CustomerBalanceReconciliation = {
+  customer: Customer;
+  purchases: sell[];
+  payments: Payment[];
+  removedPurchaseIds: string[];
+  balanceUSD: number;
+  balanceSYP: number;
+};
+
+const getPurchaseIds = (purchases: unknown) =>
+  Array.isArray(purchases)
+    ? purchases
+        .map((purchaseId) => String(purchaseId || "").trim())
+        .filter(Boolean)
+    : [];
+
+const sameStringList = (left: string[], right: string[]) =>
+  left.length === right.length && left.every((item, index) => item === right[index]);
+
+const getSaleRemainingUSD = (sale: Partial<sell>) =>
+  roundMoney(
+    toMoneyNumber(sale.remainingUSD, toMoneyNumber(sale.remainingDebt)),
+  );
+
+const getSaleRemainingSYP = (sale: Partial<sell>) => {
+  const currency = normalizeCurrency(sale.paymentCurrency || sale.currency);
+
+  if (currency !== "SYP") return 0;
+
+  return roundMoney(
+    toMoneyNumber(sale.remainingSYP, toMoneyNumber(sale.remainingOriginal)),
+  );
+};
+
+const shouldCountCustomerPaymentInBalance = (payment: Partial<Payment>) =>
+  payment.type === "income" && !payment.sellId;
+
+export const reconcileCustomerBalanceInternal = async (
+  id: string,
+): Promise<CustomerBalanceReconciliation | null> => {
+  const customerRef = ref(database, `customer/${id}`);
+  const [customerSnap, sellsSnap, paymentsSnap] = await Promise.all([
+    get(customerRef),
+    get(ref(database, "sells")),
+    get(ref(database, "payment")),
+  ]);
+
+  if (!customerSnap.exists()) return null;
+
+  const customer = customerSnap.val() as Customer;
+  const sellsData = sellsSnap.exists()
+    ? (sellsSnap.val() as Record<string, any>)
+    : {};
+  const paymentsData = paymentsSnap.exists()
+    ? (paymentsSnap.val() as Record<string, any>)
+    : {};
+
+  const customerPurchases = Object.entries(sellsData)
+    .map(([key, sale]) => ({ ...(sale || {}), id: sale?.id || key }) as sell)
+    .filter((sale) => sale.customerId === id);
+  const actualPurchaseIds = customerPurchases
+    .map((sale) => String(sale.id || "").trim())
+    .filter(Boolean);
+  const currentPurchaseIds = getPurchaseIds(customer.purchases);
+  const existingPurchaseIds = currentPurchaseIds.filter((purchaseId) =>
+    actualPurchaseIds.includes(purchaseId),
+  );
+  const cleanPurchaseIds = Array.from(
+    new Set([...existingPurchaseIds, ...actualPurchaseIds]),
+  );
+  const removedPurchaseIds = currentPurchaseIds.filter(
+    (purchaseId) => !cleanPurchaseIds.includes(purchaseId),
+  );
+  const payments = Object.entries(paymentsData)
+    .map(
+      ([key, payment]) =>
+        ({ ...(payment || {}), id: payment?.id || key }) as Payment,
+    )
+    .filter((payment) => payment.customerId === id);
+
+  const invoicesBalanceUSD = customerPurchases.reduce(
+    (sum, sale) => roundMoney(sum - getSaleRemainingUSD(sale)),
+    0,
+  );
+  const invoicesBalanceSYP = customerPurchases.reduce(
+    (sum, sale) => roundMoney(sum - getSaleRemainingSYP(sale)),
+    0,
+  );
+  const directPaymentsBalanceUSD = payments
+    .filter(shouldCountCustomerPaymentInBalance)
+    .reduce(
+      (sum, payment) =>
+        roundMoney(
+          sum + toMoneyNumber(payment.amountUSD, toMoneyNumber(payment.amount)),
+        ),
+      0,
+    );
+  const directPaymentsBalanceSYP = payments
+    .filter(shouldCountCustomerPaymentInBalance)
+    .reduce(
+      (sum, payment) =>
+        roundMoney(
+          sum +
+            toMoneyNumber(
+              payment.balanceSYPChange,
+              toMoneyNumber(payment.amountSYP),
+            ),
+        ),
+      0,
+    );
+  const balanceUSD = roundMoney(invoicesBalanceUSD + directPaymentsBalanceUSD);
+  const balanceSYP = roundMoney(invoicesBalanceSYP + directPaymentsBalanceSYP);
+  const patch = {
+    balance: balanceUSD,
+    balanceUSD,
+    balanceSYP,
+    purchases: cleanPurchaseIds,
+  };
+  const needsUpdate =
+    roundMoney(toMoneyNumber(customer.balance)) !== patch.balance ||
+    roundMoney(toMoneyNumber(customer.balanceUSD, toMoneyNumber(customer.balance))) !==
+      patch.balanceUSD ||
+    roundMoney(toMoneyNumber(customer.balanceSYP)) !== patch.balanceSYP ||
+    !sameStringList(currentPurchaseIds, cleanPurchaseIds);
+  const reconciledCustomer = {
+    ...customer,
+    ...patch,
+    updatedDate: needsUpdate ? new Date().toLocaleString() : customer.updatedDate,
+  };
+
+  if (needsUpdate) {
+    await update(customerRef, {
+      ...patch,
+      updatedDate: reconciledCustomer.updatedDate,
+    });
+  }
+
+  return {
+    customer: reconciledCustomer,
+    purchases: customerPurchases,
+    payments,
+    removedPurchaseIds,
+    balanceUSD,
+    balanceSYP,
+  };
+};
 
 /* =========================================================
    ✅ 1. جلب جميع العملاء
@@ -157,7 +304,7 @@ export const updateCustomerInternal = async (
   }
 
   await update(dbRef, updatedCustomer);
-  return updatedCustomer;
+  return (await reconcileCustomerBalanceInternal(id))?.customer || updatedCustomer;
 };
 
 /* =========================================================
@@ -187,9 +334,7 @@ export const getAllcustomerInternal = async (): Promise<Customer[]> => {
 export const getCustomerByIdInternal = async (
   id: string
 ): Promise<Customer | null> => {
-  const dbRef = ref(database, `customer/${id}`);
-  const snapshot = await get(dbRef);
-  return snapshot.exists() ? snapshot.val() : null;
+  return (await reconcileCustomerBalanceInternal(id))?.customer || null;
 };
 
 /* =========================================================
@@ -201,11 +346,11 @@ export const getCustomerById = async (req: Request, res: Response) => {
 
   try {
     // 🔹 جلب العميل فقط
-    const customerSnap = await get(ref(database, `customer/${id}`));
-    if (!customerSnap.exists())
+    const reconciliation = await reconcileCustomerBalanceInternal(id);
+    if (!reconciliation)
       return res.status(404).json({ error: "Customer not found" });
 
-    const customer: Customer = customerSnap.val();
+    const customer: Customer = reconciliation.customer;
 
     const toNumber = (value: unknown) => {
       const numberValue = Number(value);
@@ -219,13 +364,7 @@ export const getCustomerById = async (req: Request, res: Response) => {
       return "غير محدد";
     };
 
-    const paymentsRef = ref(database, "payment");
-    const paymentsSnap = await get(paymentsRef);
-    const payments = paymentsSnap.exists()
-      ? (Object.values(paymentsSnap.val()).filter(
-          (p: any) => p.customerId === id
-        ) as any[])
-      : [];
+    const payments = reconciliation.payments;
 
     const paymentsBySell = payments.reduce(
       (grouped: Record<string, any[]>, payment: any) => {
@@ -275,16 +414,7 @@ export const getCustomerById = async (req: Request, res: Response) => {
     };
 
     // 🔹 جلب مشترياته فقط
-    let purchases: sell[] = [];
-    if (customer.purchases?.length) {
-      const promises = customer.purchases.map(async (pid: string) => {
-        const pSnap = await get(ref(database, `sells/${pid}`));
-        return pSnap.exists() ? pSnap.val() : null;
-      });
-      purchases = (await Promise.all(promises))
-        .filter(Boolean)
-        .map(enrichSellForCustomer) as sell[];
-    }
+    const purchases = reconciliation.purchases.map(enrichSellForCustomer) as sell[];
 
     res.json({
       data: {

@@ -1,4 +1,5 @@
 import {
+  reconcileCustomerBalanceInternal,
   updateCustomerBalanceInternal,
   updateCustomerInternal,
 } from "../controllers/customer.controller";
@@ -1920,6 +1921,7 @@ export const handleCustomerReturnSafe = async (newReturn: {
     ref(database, `sells/${newReturn.referenceId}`),
     calculation.updatedSell,
   );
+  await reconcileCustomerBalanceInternal(newReturn.customerId);
 
   return {
     success: true,
