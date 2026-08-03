@@ -1062,7 +1062,12 @@ export const handleSell = async ({
 
     if (!stockUpdater) {
       for (const product of productsForSell) {
-        await updateQuantityOnSell(product.id, product.warehouse, product.qty);
+        await updateQuantityOnSell(
+          product.id,
+          product.warehouse,
+          product.qty,
+          product.code,
+        );
         stockUpdatedProducts.push(product);
       }
     }
@@ -1082,6 +1087,7 @@ export const handleSell = async ({
                 product.id,
                 product.warehouse,
                 product.qty,
+                product.code,
               ).catch((rollbackError) => {
                 console.error("Failed to rollback sell stock update", rollbackError);
               }),
@@ -1972,7 +1978,8 @@ export const warehouseTransfer = async (transferData: {
     await updateQuantityOnSell(
       transferData.productId,
       transferData.oldWarehouse,
-      transferData.quantity
+      transferData.quantity,
+      product.product.code,
     );
 
     await createOrUpdateProductInternal({

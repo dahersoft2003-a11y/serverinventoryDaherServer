@@ -119,13 +119,23 @@ const normalizeProductRecord = (
   product: Partial<Product> | null | undefined,
 ): Product => {
   const normalizedProduct = product || {};
+  const normalizedWarehouseName = normalizeWarehouseName(warehouseName);
+  const legacyProductId =
+    normalizedProduct.id && normalizedProduct.id !== productId
+      ? normalizedProduct.id
+      : undefined;
+  const legacyWarehouse =
+    normalizedProduct.warehouse &&
+    normalizeWarehouseName(normalizedProduct.warehouse) !== normalizedWarehouseName
+      ? normalizedProduct.warehouse
+      : undefined;
 
   return {
     ...normalizedProduct,
-    id: normalizedProduct.id || productId,
-    warehouse: normalizeWarehouseName(
-      normalizedProduct.warehouse || warehouseName,
-    ),
+    id: productId,
+    legacyId: legacyProductId,
+    warehouse: normalizedWarehouseName,
+    legacyWarehouse,
     category: normalizedProduct.category || "",
     quantity: Number(normalizedProduct.quantity || 0),
     reservedQuantity: Number(normalizedProduct.reservedQuantity || 0),
@@ -398,15 +408,46 @@ export const adjustProductQuantityInternal = async (
   productId: string,
   warehouse: string,
   quantityDelta: number,
+  productCode?: string,
 ): Promise<Product> => {
   const delta = Number(quantityDelta);
 
-  if (!productId || !warehouse || !Number.isFinite(delta) || delta === 0) {
+  if (
+    (!productId && !productCode) ||
+    !warehouse ||
+    !Number.isFinite(delta) ||
+    delta === 0
+  ) {
     throw new Error("Invalid product quantity adjustment");
   }
 
   const warehouseKey = await resolveProductsWarehouseKey(warehouse);
-  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
+  let resolvedProductId = productId;
+
+  if (productCode) {
+    const submittedProductSnapshot = productId
+      ? await get(ref(database, `products/${warehouseKey}/${productId}`))
+      : null;
+
+    if (!submittedProductSnapshot?.exists()) {
+      const warehouseSnapshot = await get(ref(database, `products/${warehouseKey}`));
+      const productEntries = warehouseSnapshot.exists()
+        ? (Object.entries(warehouseSnapshot.val()) as Array<[string, Product]>)
+        : [];
+      const normalizedProductCode = String(productCode).trim().toLowerCase();
+      const matchingEntry = productEntries.find(
+        ([, entryProduct]) =>
+          String(entryProduct?.code || "").trim().toLowerCase() ===
+          normalizedProductCode,
+      );
+
+      if (matchingEntry) {
+        resolvedProductId = matchingEntry[0];
+      }
+    }
+  }
+
+  const productRef = ref(database, `products/${warehouseKey}/${resolvedProductId}`);
   let transactionError = "";
   let updatedProduct: Product | null = null;
 
@@ -434,6 +475,8 @@ export const adjustProductQuantityInternal = async (
 
     updatedProduct = {
       ...currentProduct,
+      id: resolvedProductId,
+      warehouse: warehouseKey || warehouse,
       quantity: nextQuantity,
       updatedDate: new Date().toLocaleString(),
     };
@@ -454,11 +497,13 @@ export const updateQuantityOnSell = async (
   productId: string,
   warehouse: string,
   soldQuantity: number,
+  productCode?: string,
 ): Promise<Product | null> => {
   return adjustProductQuantityInternal(
     productId,
     warehouse,
     -Number(soldQuantity || 0),
+    productCode,
   );
 };
 
@@ -506,7 +551,7 @@ export const assertProductAvailableForSellInternal = async (
   const normalizedProduct: Product = {
     ...product,
     id: resolvedProductId,
-    warehouse: product.warehouse || warehouse,
+    warehouse: warehouseKey || warehouse,
   };
   const availableQuantity =
     Number(normalizedProduct.quantity || 0) -
