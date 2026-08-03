@@ -10,6 +10,27 @@ import {
 } from "../utils/saleReturn";
 import { resolveProductsWarehouseKey } from "./products.controller";
 
+const stripUndefined = <T>(value: T): T => {
+  if (Array.isArray(value)) {
+    return value.map(stripUndefined) as T;
+  }
+
+  if (value && typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>).reduce(
+      (cleaned, [key, entryValue]) => {
+        if (entryValue !== undefined) {
+          cleaned[key] = stripUndefined(entryValue);
+        }
+
+        return cleaned;
+      },
+      {} as Record<string, unknown>,
+    ) as T;
+  }
+
+  return value;
+};
+
 // 🧩 جلب جميع فواتير البيع
 export const getAllSells = async (_req: Request, res: Response) => {
   try {
@@ -69,11 +90,11 @@ export const createSellInternal = async (newSell: sell): Promise<sell> => {
     const id = uuidv4();
     const NowDate = new Date().toLocaleString();
 
-    const sellData: sell = {
+    const sellData: sell = stripUndefined({
       ...newSell,
       id,
       date: NowDate,
-    };
+    });
 
     await set(ref(database, `sells/${id}`), sellData);
     return sellData;

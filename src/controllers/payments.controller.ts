@@ -11,6 +11,27 @@ import {
   toMoneyNumber,
 } from "../utils/money";
 
+const stripUndefined = <T>(value: T): T => {
+  if (Array.isArray(value)) {
+    return value.map(stripUndefined) as T;
+  }
+
+  if (value && typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>).reduce(
+      (cleaned, [key, entryValue]) => {
+        if (entryValue !== undefined) {
+          cleaned[key] = stripUndefined(entryValue);
+        }
+
+        return cleaned;
+      },
+      {} as Record<string, unknown>,
+    ) as T;
+  }
+
+  return value;
+};
+
 const normalizePaymentForStorage = (paymentData: Payment): Payment => {
   const paymentCurrency = normalizeCurrency(
     paymentData.paymentCurrency || paymentData.currency,
@@ -23,7 +44,7 @@ const normalizePaymentForStorage = (paymentData: Payment): Payment => {
     amountOriginal: paymentData.amountOriginal ?? paymentData.amount_base,
   });
 
-  return {
+  return stripUndefined({
     ...paymentData,
     currency: paymentCurrency,
     paymentCurrency,
@@ -33,7 +54,7 @@ const normalizePaymentForStorage = (paymentData: Payment): Payment => {
     amountUSD: money.amountUSD,
     amountSYP: money.amountSYP,
     amountOriginal: money.amountOriginal,
-  };
+  });
 };
 
 const normalizeStoredDate = (value: unknown) => {
