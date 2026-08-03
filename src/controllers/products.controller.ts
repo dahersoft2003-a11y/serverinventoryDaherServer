@@ -552,17 +552,29 @@ export const adjustProductQuantityInternal = async (
     database,
     `products/${lookup.warehouseKey}/${lookup.productId}`,
   );
+  const lookupProduct: Product = {
+    ...lookup.product,
+    id: lookup.productId,
+    warehouse: lookup.warehouseKey || warehouse,
+  };
   let transactionError = "";
   let updatedProduct: Product | null = null;
 
   const result = await runTransaction(productRef, (currentProduct: Product | null) => {
-    if (!currentProduct) {
+    transactionError = "";
+    updatedProduct = null;
+
+    // The Firebase web SDK may call the transaction once with an empty local
+    // cache before the server value arrives. Seed it from the confirmed lookup.
+    const productForUpdate = currentProduct || lookupProduct;
+
+    if (!productForUpdate) {
       transactionError = "Product not found";
       return;
     }
 
-    const currentQuantity = Number(currentProduct.quantity || 0);
-    const reservedQuantity = Number(currentProduct.reservedQuantity || 0);
+    const currentQuantity = Number(productForUpdate.quantity || 0);
+    const reservedQuantity = Number(productForUpdate.reservedQuantity || 0);
     const nextQuantity = currentQuantity + delta;
     const requestedQuantity = Math.abs(delta);
     const availableQuantity = currentQuantity - reservedQuantity;
@@ -578,7 +590,7 @@ export const adjustProductQuantityInternal = async (
     }
 
     updatedProduct = {
-      ...currentProduct,
+      ...productForUpdate,
       id: lookup.productId,
       warehouse: lookup.warehouseKey || warehouse,
       quantity: nextQuantity,
