@@ -466,18 +466,51 @@ export const assertProductAvailableForSellInternal = async (
   productId: string,
   warehouse: string,
   soldQuantity: number,
+  productCode?: string,
 ) => {
   const warehouseKey = await resolveProductsWarehouseKey(warehouse);
-  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
-  const snapshot = await get(productRef);
+  let resolvedProductId = productId;
+  let product: Product | null = null;
 
-  if (!snapshot.exists()) {
-    throw new Error("Product not found");
+  if (productId) {
+    const productRef = ref(database, `products/${warehouseKey}/${productId}`);
+    const snapshot = await get(productRef);
+
+    if (snapshot.exists()) {
+      product = snapshot.val() as Product;
+    }
   }
 
-  const product: Product = snapshot.val();
+  if (!product && productCode) {
+    const warehouseSnapshot = await get(ref(database, `products/${warehouseKey}`));
+    const productEntries = warehouseSnapshot.exists()
+      ? (Object.entries(warehouseSnapshot.val()) as Array<[string, Product]>)
+      : [];
+    const normalizedProductCode = String(productCode).trim().toLowerCase();
+    const matchingEntry = productEntries.find(
+      ([, entryProduct]) =>
+        String(entryProduct?.code || "").trim().toLowerCase() ===
+        normalizedProductCode,
+    );
+
+    if (matchingEntry) {
+      resolvedProductId = matchingEntry[0];
+      product = matchingEntry[1];
+    }
+  }
+
+  if (!product) {
+    throw new Error(`المنتج غير موجود: ${productCode || productId}`);
+  }
+
+  const normalizedProduct: Product = {
+    ...product,
+    id: resolvedProductId,
+    warehouse: product.warehouse || warehouse,
+  };
   const availableQuantity =
-    Number(product.quantity || 0) - Number(product.reservedQuantity || 0);
+    Number(normalizedProduct.quantity || 0) -
+    Number(normalizedProduct.reservedQuantity || 0);
 
   if (availableQuantity < Number(soldQuantity || 0)) {
     throw new Error(
@@ -485,7 +518,7 @@ export const assertProductAvailableForSellInternal = async (
     );
   }
 
-  return product;
+  return normalizedProduct;
 };
 
 export const reserveProductQuantityInternal = async (

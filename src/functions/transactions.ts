@@ -959,6 +959,7 @@ export const handleSell = async ({
           product.id,
           product.warehouse,
           product.qty,
+          product.code,
         );
 
         normalizedProducts.push(
