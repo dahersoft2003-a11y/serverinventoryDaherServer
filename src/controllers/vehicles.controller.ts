@@ -677,6 +677,20 @@ export const loadVehicle = async (req: Request, res: Response) => {
       }
 
       const existingTarget = targetEntry?.[1];
+      const requestedSellPrice = toNumber(item.sellPrice);
+      const existingSellPrice = toNumber(existingTarget?.sellPrice);
+      const sourceSellPrice = toNumber(sourceProduct.sellPrice);
+      const resolvedSellPrice =
+        requestedSellPrice > 0
+          ? requestedSellPrice
+          : existingSellPrice > 0
+            ? existingSellPrice
+            : sourceSellPrice;
+
+      if (resolvedSellPrice <= 0) {
+        throw new Error(`سعر المبيع مطلوب للمنتج ${sourceProduct.code}`);
+      }
+
       const nextTargetProduct: Product = {
         ...sourceProduct,
         ...existingTarget,
@@ -684,7 +698,7 @@ export const loadVehicle = async (req: Request, res: Response) => {
         warehouse: vehicle.name,
         quantity: toNumber(existingTarget?.quantity) + quantity,
         reservedQuantity: toNumber(existingTarget?.reservedQuantity),
-        sellPrice: toNumber(item.sellPrice, toNumber(sourceProduct.sellPrice)),
+        sellPrice: resolvedSellPrice,
         updatedDate: now,
       };
 
@@ -796,7 +810,9 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
 
       const stockSellPrice = toNumber(stockProduct.sellPrice);
       if (stockSellPrice <= 0) {
-        throw new Error(`Invalid sell price for ${stockProduct.code}`);
+        throw new Error(
+          `سعر المبيع مطلوب للمنتج ${stockProduct.code}. عدل سعر المنتج في السيارة قبل البيع.`,
+        );
       }
 
       return {
