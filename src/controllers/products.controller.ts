@@ -1,6 +1,14 @@
 import e, { Request, Response } from "express";
 import { Product } from "../types/product";
-import { ref, get, set, push, remove ,update } from "firebase/database";
+import {
+  ref,
+  get,
+  set,
+  push,
+  remove,
+  update,
+  runTransaction,
+} from "firebase/database";
 import { database } from "../firebaseConfig";
 import { getCurrentUserFromRequest } from "../utils/currentUser";
 
@@ -386,35 +394,72 @@ export const create = async (req: Request, res: Response) => {
 };
 
 // ✅ تحديث كمية المنتج بعد بيع داخليًا
+export const adjustProductQuantityInternal = async (
+  productId: string,
+  warehouse: string,
+  quantityDelta: number,
+): Promise<Product> => {
+  const delta = Number(quantityDelta);
+
+  if (!productId || !warehouse || !Number.isFinite(delta) || delta === 0) {
+    throw new Error("Invalid product quantity adjustment");
+  }
+
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
+  let transactionError = "";
+  let updatedProduct: Product | null = null;
+
+  const result = await runTransaction(productRef, (currentProduct: Product | null) => {
+    if (!currentProduct) {
+      transactionError = "Product not found";
+      return;
+    }
+
+    const currentQuantity = Number(currentProduct.quantity || 0);
+    const reservedQuantity = Number(currentProduct.reservedQuantity || 0);
+    const nextQuantity = currentQuantity + delta;
+    const requestedQuantity = Math.abs(delta);
+    const availableQuantity = currentQuantity - reservedQuantity;
+
+    if (delta < 0 && availableQuantity < requestedQuantity) {
+      transactionError = `Insufficient available quantity. Available: ${availableQuantity}, requested: ${requestedQuantity}`;
+      return;
+    }
+
+    if (nextQuantity < 0) {
+      transactionError = "Product quantity cannot be negative";
+      return;
+    }
+
+    updatedProduct = {
+      ...currentProduct,
+      quantity: nextQuantity,
+      updatedDate: new Date().toLocaleString(),
+    };
+
+    return updatedProduct;
+  });
+
+  if (!result.committed || transactionError || !updatedProduct) {
+    throw new Error(transactionError || "Product quantity update was aborted");
+  }
+
+  fetchReset();
+
+  return updatedProduct;
+};
+
 export const updateQuantityOnSell = async (
   productId: string,
   warehouse: string,
   soldQuantity: number,
 ): Promise<Product | null> => {
-  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
-  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
-  const snapshot = await get(productRef);
-  if (!snapshot.exists()) return null;
-
-  const existingProduct: Product = snapshot.val();
-  const currentQuantity = Number(existingProduct.quantity || 0);
-  const reservedQuantity = Number(existingProduct.reservedQuantity || 0);
-  const availableQuantity = currentQuantity - reservedQuantity;
-
-  if (availableQuantity < soldQuantity) {
-    throw new Error(
-      `Insufficient available quantity. Available: ${availableQuantity}, requested: ${soldQuantity}`,
-    );
-  }
-
-  fetchReset();
-
-  const newQuantity = currentQuantity - soldQuantity;
-  existingProduct.quantity = newQuantity;
-  existingProduct.updatedDate = new Date().toLocaleString();
-  await set(productRef, existingProduct);
-
-  return existingProduct;
+  return adjustProductQuantityInternal(
+    productId,
+    warehouse,
+    -Number(soldQuantity || 0),
+  );
 };
 
 export const assertProductAvailableForSellInternal = async (

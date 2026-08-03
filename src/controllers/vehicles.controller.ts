@@ -134,14 +134,19 @@ const getAllWarehouses = async (): Promise<Warehouse[]> => {
   return snapshot.exists() ? (Object.values(snapshot.val()) as Warehouse[]) : [];
 };
 
-const getVehicleWarehouses = async (): Promise<VehicleWarehouse[]> =>
+const getVehicleWarehouses = async ({
+  activeOnly = false,
+}: {
+  activeOnly?: boolean;
+} = {}): Promise<VehicleWarehouse[]> =>
   (await getAllWarehouses())
     .filter((warehouse) => warehouse.type === "vehicle")
     .map((warehouse) => ({
       ...warehouse,
-      type: "vehicle",
+      type: "vehicle" as const,
       isActive: warehouse.isActive !== false,
-    }));
+    }))
+    .filter((warehouse) => !activeOnly || warehouse.isActive !== false);
 
 const getVehicleById = async (id: string) => {
   const snapshot = await get(ref(database, `${WAREHOUSES_PATH}/${id}`));
@@ -238,6 +243,47 @@ const requireAdmin = (req: Request, res: Response) => {
   return currentUser;
 };
 
+const getUserRecord = async (userKey: string) => {
+  const snapshot = await get(ref(database, `${USERS_PATH}/${userKey}`));
+  return snapshot.exists() ? (snapshot.val() as UserVehicleRecord) : null;
+};
+
+const attachVehicleToUser = async (vehicle: VehicleWarehouse) => {
+  if (!vehicle.driverId) return;
+
+  await update(ref(database, `${USERS_PATH}/${vehicle.driverId}`), {
+    vehicleId: vehicle.id,
+    vehicleName: vehicle.name,
+    updatedAt: new Date().toISOString(),
+  }).catch((error) => {
+    console.error("Failed to attach vehicle to user", error);
+  });
+};
+
+const clearVehicleFromUser = async (
+  userKey: string | undefined,
+  vehicle: VehicleWarehouse,
+) => {
+  if (!userKey) return;
+
+  const userRecord = await getUserRecord(userKey);
+  if (!userRecord) return;
+
+  const isLinkedToVehicle =
+    matchesLookupKey(userRecord.vehicleId, getLookupKeys(vehicle.id)) ||
+    matchesLookupKey(userRecord.vehicleName, getLookupKeys(vehicle.name));
+
+  if (!isLinkedToVehicle) return;
+
+  await update(ref(database, `${USERS_PATH}/${userKey}`), {
+    vehicleId: null,
+    vehicleName: null,
+    updatedAt: new Date().toISOString(),
+  }).catch((error) => {
+    console.error("Failed to clear vehicle from previous user", error);
+  });
+};
+
 const getUserRecordForCurrentUser = async (
   currentUser: CurrentUser,
 ): Promise<UserVehicleRecord | null> => {
@@ -272,7 +318,7 @@ const getUserRecordForCurrentUser = async (
 
 const getCurrentUserVehicles = async (currentUser: CurrentUser) => {
   const userRecord = await getUserRecordForCurrentUser(currentUser);
-  const vehicles = await getVehicleWarehouses();
+  const vehicles = await getVehicleWarehouses({ activeOnly: true });
   const identityKeys = getLookupKeys(
     currentUser.userId,
     currentUser.username,
@@ -376,6 +422,44 @@ export const getMyVehicleDashboard = async (req: Request, res: Response) => {
   }
 };
 
+export const getMyVehicleDiagnostics = async (req: Request, res: Response) => {
+  try {
+    const currentUser = getCurrentUserFromRequest(req);
+    if (!currentUser) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const userRecord = await getUserRecordForCurrentUser(currentUser);
+    const activeVehicles = await getCurrentUserVehicles(currentUser);
+    const allVehicleSummaries = (await getVehicleWarehouses()).map((vehicle) => ({
+      id: vehicle.id,
+      name: vehicle.name,
+      isActive: vehicle.isActive !== false,
+      driverId: vehicle.driverId || "",
+      driverName: vehicle.driverName || "",
+    }));
+
+    res.json({
+      currentUser,
+      userRecordFound: Boolean(userRecord),
+      userVehicleId: userRecord?.vehicleId || "",
+      userVehicleName: userRecord?.vehicleName || "",
+      matchedActiveVehicles: activeVehicles.map((vehicle) => ({
+        id: vehicle.id,
+        name: vehicle.name,
+        driverId: vehicle.driverId || "",
+        driverName: vehicle.driverName || "",
+      })),
+      allVehicles: currentUser.role === "admin" ? allVehicleSummaries : undefined,
+    });
+  } catch (error: any) {
+    console.error("Error fetching vehicle diagnostics:", error);
+    res.status(500).json({
+      message: error.message || "Failed to fetch vehicle diagnostics",
+    });
+  }
+};
+
 export const createVehicle = async (req: Request, res: Response) => {
   const currentUser = requireAdmin(req, res);
   if (!currentUser) return;
@@ -428,15 +512,7 @@ export const createVehicle = async (req: Request, res: Response) => {
 
     await set(ref(database, `${WAREHOUSES_PATH}/${id}`), vehicle);
 
-    if (vehicle.driverId) {
-      await update(ref(database, `${USERS_PATH}/${vehicle.driverId}`), {
-        vehicleId: vehicle.id,
-        vehicleName: vehicle.name,
-        updatedAt: new Date().toISOString(),
-      }).catch((error) => {
-        console.error("Failed to attach vehicle to user", error);
-      });
-    }
+    await attachVehicleToUser(vehicle);
 
     res.json({ message: "Vehicle created", data: vehicle });
   } catch (error: any) {
@@ -488,15 +564,14 @@ export const updateVehicle = async (req: Request, res: Response) => {
 
     const updatedVehicle = { ...vehicle, ...updates };
 
-    if (updatedVehicle.driverId) {
-      await update(ref(database, `${USERS_PATH}/${updatedVehicle.driverId}`), {
-        vehicleId: updatedVehicle.id,
-        vehicleName: updatedVehicle.name,
-        updatedAt: new Date().toISOString(),
-      }).catch((error) => {
-        console.error("Failed to attach vehicle to user", error);
-      });
+    const previousDriverId = normalizeLookupValue(vehicle.driverId);
+    const nextDriverId = normalizeLookupValue(updatedVehicle.driverId);
+
+    if (previousDriverId && previousDriverId !== nextDriverId) {
+      await clearVehicleFromUser(previousDriverId, vehicle);
     }
+
+    await attachVehicleToUser(updatedVehicle);
 
     res.json({ message: "Vehicle updated", data: updatedVehicle });
   } catch (error: any) {
@@ -513,6 +588,10 @@ export const loadVehicle = async (req: Request, res: Response) => {
     const vehicle = await getVehicleById(req.params.id);
     if (!vehicle) {
       return res.status(404).json({ message: "Vehicle not found" });
+    }
+
+    if (vehicle.isActive === false) {
+      return res.status(400).json({ message: "Vehicle is inactive" });
     }
 
     const sourceWarehouse = String(req.body.sourceWarehouse || "").trim();
@@ -686,6 +765,10 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
     }
 
     const vehicle = selection.vehicle;
+    if (vehicle.isActive === false) {
+      return res.status(400).json({ message: "Vehicle is inactive" });
+    }
+
     const rawProducts = Array.isArray(rawSell.products) ? rawSell.products : [];
 
     if (!rawSell.customerId) {

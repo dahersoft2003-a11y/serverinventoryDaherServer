@@ -3,6 +3,7 @@ import {
   createMyVehicleSale,
   createVehicle,
   getAllVehicles,
+  getMyVehicleDiagnostics,
   getMyVehicleDashboard,
   loadVehicle,
   updateVehicle,
@@ -13,6 +14,7 @@ const router = express.Router();
 router.get("/", getAllVehicles);
 router.post("/", createVehicle);
 router.get("/me", getMyVehicleDashboard);
+router.get("/me/diagnostics", getMyVehicleDiagnostics);
 router.post("/me/sell", createMyVehicleSale);
 router.put("/:id", updateVehicle);
 router.post("/:id/load", loadVehicle);

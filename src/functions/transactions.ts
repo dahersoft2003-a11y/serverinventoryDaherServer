@@ -4,6 +4,7 @@ import {
 } from "../controllers/customer.controller";
 import { createPaymentInternal } from "../controllers/payments.controller";
 import {
+  adjustProductQuantityInternal,
   assertProductAvailableForSellInternal,
   createOrUpdateProductInternal,
   getProductByIdInternal,
@@ -1006,7 +1007,25 @@ export const handleSell = async ({
       );
     }
 
-    const sellData = await createSellInternal({
+    const accountPreflight: Array<Promise<void>> = [
+      assertAccountCanTransact(newSell.salesAccountId, "Sales"),
+    ];
+
+    if (paidAmount > 0) {
+      accountPreflight.push(
+        assertAccountCanTransact(newSell.paymentAccountId, "Payment"),
+      );
+    }
+
+    if (sellMoney.remainingUSD > 0) {
+      accountPreflight.push(
+        assertAccountCanTransact(newSell.receivableAccountId, "Receivable"),
+      );
+    }
+
+    await Promise.all(accountPreflight);
+
+    const sellToStore: sell = {
       ...newSell,
       products: productsForSell,
       paymentStatus: sellStatus,
@@ -1036,13 +1055,45 @@ export const handleSell = async ({
       discountSYP: sellMoney.discountSYP,
       discountOriginal: sellMoney.discountOriginal,
       discount: sellMoney.discountUSD,
-    });
+    };
 
-    for (const product of productsForSell) {
-      if (stockUpdater) {
-        await stockUpdater(product);
-      } else {
+    const stockUpdatedProducts: sell["products"] = [];
+
+    if (!stockUpdater) {
+      for (const product of productsForSell) {
         await updateQuantityOnSell(product.id, product.warehouse, product.qty);
+        stockUpdatedProducts.push(product);
+      }
+    }
+
+    let sellData: sell;
+
+    try {
+      sellData = await createSellInternal(sellToStore);
+    } catch (createError) {
+      if (!stockUpdater) {
+        await Promise.all(
+          stockUpdatedProducts
+            .slice()
+            .reverse()
+            .map((product) =>
+              adjustProductQuantityInternal(
+                product.id,
+                product.warehouse,
+                product.qty,
+              ).catch((rollbackError) => {
+                console.error("Failed to rollback sell stock update", rollbackError);
+              }),
+            ),
+        );
+      }
+
+      throw createError;
+    }
+
+    if (stockUpdater) {
+      for (const product of productsForSell) {
+        await stockUpdater(product);
       }
     }
 
