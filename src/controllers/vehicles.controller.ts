@@ -794,6 +794,11 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
         throw new Error(`Invalid quantity for ${stockProduct.code}`);
       }
 
+      const stockSellPrice = toNumber(stockProduct.sellPrice);
+      if (stockSellPrice <= 0) {
+        throw new Error(`Invalid sell price for ${stockProduct.code}`);
+      }
+
       return {
         category: stockProduct.category || "",
         code: stockProduct.code,
@@ -801,10 +806,10 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
         name: stockProduct.name,
         payPrice: toNumber(stockProduct.payPrice),
         quantity: toNumber(stockProduct.quantity),
-        sellPrice: toNumber(rawProduct.sellPrice, toNumber(stockProduct.sellPrice)),
+        sellPrice: stockSellPrice,
         wholesalePrice: toNumber(stockProduct.wholesalePrice),
         superWholesalePrice: toNumber(stockProduct.superWholesalePrice),
-        selectedPriceType: rawProduct.selectedPriceType || "custom",
+        selectedPriceType: "sellPrice",
         unit: stockProduct.unit || "",
         updatedDate: stockProduct.updatedDate || "",
         warehouse: vehicle.name,
