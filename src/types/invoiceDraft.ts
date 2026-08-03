@@ -27,4 +27,5 @@ export interface InvoiceDraft {
   version: number;
   updatedAt: string;
   updatedBy?: string;
+  clearedAt?: string;
 }

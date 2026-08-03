@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { get, ref, remove, set } from "firebase/database";
+import { get, ref, set } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { handleSell } from "../functions/transactions";
 import { InvoiceDraft, InvoiceDraftProduct } from "../types/invoiceDraft";
@@ -31,6 +31,37 @@ const normalizePriceType = (
 };
 
 const nowIso = () => new Date().toISOString();
+
+const toTimestamp = (value: unknown) => {
+  const timestamp = new Date(String(value || "")).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+};
+
+const isStaleWriteAfterClear = (
+  currentDraft: Partial<InvoiceDraft>,
+  draftPatch: Partial<InvoiceDraft>,
+) => {
+  const clearedAt = toTimestamp(currentDraft?.clearedAt);
+
+  if (!clearedAt) {
+    return false;
+  }
+
+  const patchUpdatedAt = toTimestamp(draftPatch?.updatedAt);
+
+  if (patchUpdatedAt) {
+    return patchUpdatedAt <= clearedAt;
+  }
+
+  const patchVersion = Number(draftPatch?.version);
+  const currentVersion = Number(currentDraft?.version || 0);
+
+  if (Number.isFinite(patchVersion)) {
+    return patchVersion < currentVersion;
+  }
+
+  return true;
+};
 
 const stripUndefined = <T>(value: T): T => {
   if (Array.isArray(value)) {
@@ -136,6 +167,7 @@ const normalizeDraft = (
     salesAccountId: String(rawDraft?.salesAccountId || ""),
     version: bumpVersion ? previousVersion + 1 : previousVersion,
     updatedAt: bumpVersion ? nowIso() : String(rawDraft?.updatedAt || nowIso()),
+    clearedAt: rawDraft?.clearedAt ? String(rawDraft.clearedAt) : undefined,
   });
 };
 
@@ -166,19 +198,52 @@ export const saveInvoiceDraftInternal = async (
   const currentDraft = snapshot.exists()
     ? snapshot.val()
     : createEmptyInvoiceDraft(userId);
+  const currentVersion = Number(currentDraft?.version || 0);
+
+  if (isStaleWriteAfterClear(currentDraft, draftPatch)) {
+    return normalizeDraft(userId, currentDraft, currentVersion, false);
+  }
+
+  const mergedDraft: Partial<InvoiceDraft> = {
+    ...currentDraft,
+    ...draftPatch,
+    updatedBy,
+  };
+
+  delete mergedDraft.clearedAt;
+
   const nextDraft = normalizeDraft(
     userId,
-    { ...currentDraft, ...draftPatch, updatedBy },
-    Number(currentDraft?.version || 0),
+    mergedDraft,
+    currentVersion,
   );
 
   await set(getDraftRef(userId), nextDraft);
   return nextDraft;
 };
 
-export const clearInvoiceDraftInternal = async (userId: string) => {
-  await remove(getDraftRef(userId));
-  return createEmptyInvoiceDraft(userId);
+export const clearInvoiceDraftInternal = async (
+  userId: string,
+  updatedBy?: string,
+) => {
+  const snapshot = await get(getDraftRef(userId));
+  const currentVersion = snapshot.exists()
+    ? Number(snapshot.val()?.version || 0)
+    : 0;
+  const clearedAt = nowIso();
+  const clearedDraft = normalizeDraft(
+    userId,
+    {
+      ...createEmptyInvoiceDraft(userId),
+      clearedAt,
+      updatedAt: clearedAt,
+      updatedBy,
+    },
+    currentVersion,
+  );
+
+  await set(getDraftRef(userId), clearedDraft);
+  return clearedDraft;
 };
 
 export const getMyInvoiceDraft = async (req: Request, res: Response) => {
@@ -212,7 +277,7 @@ export const updateMyInvoiceDraft = async (req: Request, res: Response) => {
 export const clearMyInvoiceDraft = async (req: Request, res: Response) => {
   try {
     const user = requireCurrentUser(req);
-    const draft = await clearInvoiceDraftInternal(user.userId);
+    const draft = await clearInvoiceDraftInternal(user.userId, user.username);
     res.json({ draft });
   } catch (error: any) {
     const status = error.message === "USER_REQUIRED" ? 401 : 500;
@@ -235,12 +300,12 @@ export const checkoutMyInvoiceDraft = async (req: Request, res: Response) => {
       throw new Error("تعذر إنشاء فاتورة البيع");
     }
 
-    await clearInvoiceDraftInternal(user.userId);
+    const draft = await clearInvoiceDraftInternal(user.userId, user.username);
 
     res.json({
       message: "تم إنشاء الفاتورة وتفريغ المسودة بنجاح",
       data: result,
-      draft: createEmptyInvoiceDraft(user.userId),
+      draft,
     });
   } catch (error: any) {
     const status = error.message === "USER_REQUIRED" ? 401 : 400;

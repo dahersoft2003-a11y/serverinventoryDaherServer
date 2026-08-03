@@ -113,6 +113,123 @@ export const resolveProductsWarehouseKey = async (warehouseName: string) => {
   return matchingKey || normalizedWarehouseName;
 };
 
+type ProductStockLookup = {
+  productId: string;
+  warehouseKey: string;
+  product: Product;
+};
+
+const normalizeProductCode = (value: unknown) =>
+  String(value || "").trim().toLowerCase();
+
+const findProductInWarehouseEntries = (
+  entries: Array<[string, Product]>,
+  {
+    productId,
+    productCode,
+  }: {
+    productId?: string;
+    productCode?: string;
+  },
+) => {
+  const normalizedProductId = String(productId || "");
+  const normalizedCode = normalizeProductCode(productCode);
+
+  return entries.find(
+    ([entryProductId, entryProduct]) =>
+      (normalizedProductId &&
+        (entryProductId === normalizedProductId ||
+          String(entryProduct?.id || "") === normalizedProductId)) ||
+      (normalizedCode &&
+        normalizeProductCode(entryProduct?.code) === normalizedCode),
+  );
+};
+
+const findProductStockLookup = async ({
+  productId,
+  warehouse,
+  productCode,
+}: {
+  productId?: string;
+  warehouse: string;
+  productCode?: string;
+}): Promise<ProductStockLookup | null> => {
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+
+  if (warehouseKey) {
+    const warehouseSnapshot = await get(ref(database, `products/${warehouseKey}`));
+    const warehouseEntries = warehouseSnapshot.exists()
+      ? (Object.entries(warehouseSnapshot.val()) as Array<[string, Product]>)
+      : [];
+    const matchingEntry = findProductInWarehouseEntries(warehouseEntries, {
+      productId,
+      productCode,
+    });
+
+    if (matchingEntry) {
+      return {
+        productId: matchingEntry[0],
+        warehouseKey,
+        product: matchingEntry[1],
+      };
+    }
+  }
+
+  const productsSnapshot = await get(ref(database, "products"));
+  if (!productsSnapshot.exists()) {
+    return null;
+  }
+
+  const productsByWarehouse = productsSnapshot.val() as Record<
+    string,
+    Record<string, Product>
+  >;
+  const idMatches: ProductStockLookup[] = [];
+  const codeMatches: ProductStockLookup[] = [];
+  const normalizedProductId = String(productId || "");
+  const normalizedCode = normalizeProductCode(productCode);
+
+  Object.entries(productsByWarehouse).forEach(([entryWarehouseKey, products]) => {
+    Object.entries(products || {}).forEach(([entryProductId, product]) => {
+      if (
+        normalizedProductId &&
+        (entryProductId === normalizedProductId ||
+          String(product?.id || "") === normalizedProductId)
+      ) {
+        idMatches.push({
+          productId: entryProductId,
+          warehouseKey: entryWarehouseKey,
+          product,
+        });
+      }
+
+      if (normalizedCode && normalizeProductCode(product?.code) === normalizedCode) {
+        codeMatches.push({
+          productId: entryProductId,
+          warehouseKey: entryWarehouseKey,
+          product,
+        });
+      }
+    });
+  });
+
+  if (idMatches.length === 1) {
+    return idMatches[0];
+  }
+
+  if (codeMatches.length === 1) {
+    return codeMatches[0];
+  }
+
+  if (codeMatches.length > 1) {
+    throw new Error(
+      `يوجد أكثر من منتج بالكود ${productCode}. اختر المنتج من المستودع الصحيح من جديد.`,
+    );
+  }
+
+  return null;
+};
+
 const normalizeProductRecord = (
   productId: string,
   warehouseName: string,
@@ -421,33 +538,20 @@ export const adjustProductQuantityInternal = async (
     throw new Error("Invalid product quantity adjustment");
   }
 
-  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
-  let resolvedProductId = productId;
+  const lookup = await findProductStockLookup({
+    productId,
+    warehouse,
+    productCode,
+  });
 
-  if (productCode) {
-    const submittedProductSnapshot = productId
-      ? await get(ref(database, `products/${warehouseKey}/${productId}`))
-      : null;
-
-    if (!submittedProductSnapshot?.exists()) {
-      const warehouseSnapshot = await get(ref(database, `products/${warehouseKey}`));
-      const productEntries = warehouseSnapshot.exists()
-        ? (Object.entries(warehouseSnapshot.val()) as Array<[string, Product]>)
-        : [];
-      const normalizedProductCode = String(productCode).trim().toLowerCase();
-      const matchingEntry = productEntries.find(
-        ([, entryProduct]) =>
-          String(entryProduct?.code || "").trim().toLowerCase() ===
-          normalizedProductCode,
-      );
-
-      if (matchingEntry) {
-        resolvedProductId = matchingEntry[0];
-      }
-    }
+  if (!lookup) {
+    throw new Error(`المنتج غير موجود: ${productCode || productId}`);
   }
 
-  const productRef = ref(database, `products/${warehouseKey}/${resolvedProductId}`);
+  const productRef = ref(
+    database,
+    `products/${lookup.warehouseKey}/${lookup.productId}`,
+  );
   let transactionError = "";
   let updatedProduct: Product | null = null;
 
@@ -475,8 +579,8 @@ export const adjustProductQuantityInternal = async (
 
     updatedProduct = {
       ...currentProduct,
-      id: resolvedProductId,
-      warehouse: warehouseKey || warehouse,
+      id: lookup.productId,
+      warehouse: lookup.warehouseKey || warehouse,
       quantity: nextQuantity,
       updatedDate: new Date().toLocaleString(),
     };
@@ -513,45 +617,20 @@ export const assertProductAvailableForSellInternal = async (
   soldQuantity: number,
   productCode?: string,
 ) => {
-  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
-  let resolvedProductId = productId;
-  let product: Product | null = null;
+  const lookup = await findProductStockLookup({
+    productId,
+    warehouse,
+    productCode,
+  });
 
-  if (productId) {
-    const productRef = ref(database, `products/${warehouseKey}/${productId}`);
-    const snapshot = await get(productRef);
-
-    if (snapshot.exists()) {
-      product = snapshot.val() as Product;
-    }
-  }
-
-  if (!product && productCode) {
-    const warehouseSnapshot = await get(ref(database, `products/${warehouseKey}`));
-    const productEntries = warehouseSnapshot.exists()
-      ? (Object.entries(warehouseSnapshot.val()) as Array<[string, Product]>)
-      : [];
-    const normalizedProductCode = String(productCode).trim().toLowerCase();
-    const matchingEntry = productEntries.find(
-      ([, entryProduct]) =>
-        String(entryProduct?.code || "").trim().toLowerCase() ===
-        normalizedProductCode,
-    );
-
-    if (matchingEntry) {
-      resolvedProductId = matchingEntry[0];
-      product = matchingEntry[1];
-    }
-  }
-
-  if (!product) {
+  if (!lookup) {
     throw new Error(`المنتج غير موجود: ${productCode || productId}`);
   }
 
   const normalizedProduct: Product = {
-    ...product,
-    id: resolvedProductId,
-    warehouse: warehouseKey || warehouse,
+    ...lookup.product,
+    id: lookup.productId,
+    warehouse: lookup.warehouseKey || warehouse,
   };
   const availableQuantity =
     Number(normalizedProduct.quantity || 0) -
