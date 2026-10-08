@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { ref, get, set } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { generateToken } from "../utils/jwt";
+import { commissionRateAt } from "../utils/driverFinanceCalc";
 
 const normalizePermissions = (permissions: unknown): string[] => {
   if (!Array.isArray(permissions)) return [];
@@ -48,6 +49,9 @@ export const login = async (req: Request, res: Response) => {
         permissions,
         vehicleId: user.vehicleId || "",
         vehicleName: user.vehicleName || "",
+        commissionRate: commissionRateAt(user, new Date().toISOString()),
+        commissionEffectiveFrom: user.commissionEffectiveFrom || "",
+        commissionRateHistory: user.commissionRateHistory || [],
       },
     });
   } catch (error: any) {

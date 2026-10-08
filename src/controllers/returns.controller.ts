@@ -12,6 +12,15 @@ export interface ReturnData {
   type: "sale-return" | "purchase-return";
   referenceId?: string | null;
   reason?: string;
+  productName?: string;
+  payPriceUSD?: number;
+  sellPriceUSD?: number;
+  driverId?: string;
+  vehicleId?: string;
+  cashRefundUSD?: number;
+  receivableCreditUSD?: number;
+  currency?: string;
+  exchangeRate?: number;
 }
 
 export interface ReturnRecord extends ReturnData {
@@ -108,7 +117,7 @@ export const createReturn = async (req: Request, res: Response) => {
 
     // ✅ إنشاء سجل الإرجاع
     const returnId = uuidv4();
-    const now = new Date().toLocaleString();
+    const now = new Date().toISOString();
 
     const returnRecord: ReturnRecord = {
       id: returnId,
@@ -151,7 +160,7 @@ export const createReturnInternal = async (newReturn: ReturnData) => {
     }
 
     const product = productSnap.val();
-    const now = new Date().toLocaleString();
+    const now = new Date().toISOString();
 
     applyReturnToProduct(product, newReturn.type, newReturn.qty);
     product.updatedDate = now;

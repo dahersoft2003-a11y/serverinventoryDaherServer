@@ -56,4 +56,8 @@ export interface sell {
   driverName?: string;
   sourceWarehouse?: string;
   updatedAt?: string;
+  originalProducts?: sell["products"];
+  originalTotalUSD?: number;
+  originalSubtotalUSD?: number;
+  originalDiscountUSD?: number;
 }

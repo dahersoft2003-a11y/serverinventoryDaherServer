@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { get, push, ref, set, update } from "firebase/database";
+import { get, push, ref, set, update, runTransaction } from "firebase/database";
 import { v4 as uuidv4 } from "uuid";
 import { database } from "../firebaseConfig";
 import { createTransferInternal } from "./transfer.controller";
@@ -11,6 +11,9 @@ import { handleSell } from "../functions/transactions";
 import { Product } from "../types/product";
 import { sell } from "../types/sell";
 import { Warehouse } from "../types/warehouse";
+import { requireFinanceUser } from "../utils/financeAuth";
+import { randomUUID, createHash } from "crypto";
+import { applyVehicleCustodyChange, applyVehicleLoad } from "../utils/vehicleCustody";
 import {
   getCurrentUserFromRequest,
   type CurrentUser,
@@ -227,10 +230,9 @@ const summarizeVehicle = async (vehicle: VehicleWarehouse, date?: string) => {
   };
 };
 
-const requireAdmin = (req: Request, res: Response) => {
-  const currentUser = getCurrentUserFromRequest(req);
-
-  if (!currentUser) {
+const requireAdmin = async (req: Request, res: Response) => {
+  let currentUser;
+  try { currentUser = await requireFinanceUser(req); } catch {
     res.status(401).json({ message: "Unauthorized" });
     return null;
   }
@@ -369,7 +371,7 @@ const getCurrentUserVehicleSelection = async (
 };
 
 export const getAllVehicles = async (req: Request, res: Response) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
 
   try {
     const date = String(req.query.date || todayKey());
@@ -381,13 +383,13 @@ export const getAllVehicles = async (req: Request, res: Response) => {
     res.json({ data: summaries });
   } catch (error: any) {
     console.error("Error fetching vehicles:", error);
-    res.status(500).json({ message: error.message || "Failed to fetch vehicles" });
+    res.status(error.message === "UNAUTHORIZED" ? 401 : error.message === "FORBIDDEN" ? 403 : 500).json({ message: error.message || "Failed to fetch vehicles" });
   }
 };
 
 export const getMyVehicleDashboard = async (req: Request, res: Response) => {
   try {
-    const currentUser = getCurrentUserFromRequest(req);
+    const currentUser = await requireFinanceUser(req);
     if (!currentUser) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -418,13 +420,13 @@ export const getMyVehicleDashboard = async (req: Request, res: Response) => {
     res.json({ data: selectedSummary, vehicles: summaries });
   } catch (error: any) {
     console.error("Error fetching driver vehicle:", error);
-    res.status(500).json({ message: error.message || "Failed to fetch vehicle" });
+    res.status(error.message === "UNAUTHORIZED" ? 401 : error.message === "FORBIDDEN" ? 403 : 500).json({ message: error.message || "Failed to fetch vehicle" });
   }
 };
 
 export const getMyVehicleDiagnostics = async (req: Request, res: Response) => {
   try {
-    const currentUser = getCurrentUserFromRequest(req);
+    const currentUser = await requireFinanceUser(req);
     if (!currentUser) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -461,7 +463,7 @@ export const getMyVehicleDiagnostics = async (req: Request, res: Response) => {
 };
 
 export const createVehicle = async (req: Request, res: Response) => {
-  const currentUser = requireAdmin(req, res);
+  const currentUser = await requireAdmin(req, res);
   if (!currentUser) return;
 
   try {
@@ -517,12 +519,12 @@ export const createVehicle = async (req: Request, res: Response) => {
     res.json({ message: "Vehicle created", data: vehicle });
   } catch (error: any) {
     console.error("Error creating vehicle:", error);
-    res.status(500).json({ message: error.message || "Failed to create vehicle" });
+    res.status(error.message === "UNAUTHORIZED" ? 401 : error.message === "FORBIDDEN" ? 403 : 500).json({ message: error.message || "Failed to create vehicle" });
   }
 };
 
 export const updateVehicle = async (req: Request, res: Response) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
 
   try {
     const vehicle = await getVehicleById(req.params.id);
@@ -560,204 +562,54 @@ export const updateVehicle = async (req: Request, res: Response) => {
       updatedDate: new Date().toLocaleString(),
     });
 
-    await update(ref(database, `${WAREHOUSES_PATH}/${vehicle.id}`), updates);
-
+    const actor = await requireFinanceUser(req);
+    const context = { actorId: actor.userId, now: new Date().toISOString(), transferId: randomUUID() };
+    const root = ref(database);
+    const initialSnapshot = await get(root);
+    if (!initialSnapshot.exists()) throw new Error("Vehicle state not found");
+    const transaction = await runTransaction(root, (state) => applyVehicleCustodyChange(state || initialSnapshot.val(), vehicle.id, updates, context), { applyLocally: false });
+    if (!transaction.committed) throw new Error("Vehicle update could not be committed");
     const updatedVehicle = { ...vehicle, ...updates };
-
-    const previousDriverId = normalizeLookupValue(vehicle.driverId);
-    const nextDriverId = normalizeLookupValue(updatedVehicle.driverId);
-
-    if (previousDriverId && previousDriverId !== nextDriverId) {
-      await clearVehicleFromUser(previousDriverId, vehicle);
-    }
-
-    await attachVehicleToUser(updatedVehicle);
 
     res.json({ message: "Vehicle updated", data: updatedVehicle });
   } catch (error: any) {
     console.error("Error updating vehicle:", error);
-    res.status(500).json({ message: error.message || "Failed to update vehicle" });
+    res.status(error.message === "UNAUTHORIZED" ? 401 : error.message === "FORBIDDEN" ? 403 : 500).json({ message: error.message || "Failed to update vehicle" });
   }
 };
 
 export const loadVehicle = async (req: Request, res: Response) => {
-  const currentUser = requireAdmin(req, res);
+  const currentUser = await requireAdmin(req, res);
   if (!currentUser) return;
-
   try {
-    const vehicle = await getVehicleById(req.params.id);
-    if (!vehicle) {
-      return res.status(404).json({ message: "Vehicle not found" });
-    }
-
-    if (vehicle.isActive === false) {
-      return res.status(400).json({ message: "Vehicle is inactive" });
-    }
-
-    const sourceWarehouse = String(req.body.sourceWarehouse || "").trim();
-    const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
-
-    if (
-      !sourceWarehouse ||
-      normalizeLookupValue(sourceWarehouse).toLowerCase() ===
-        normalizeLookupValue(vehicle.name).toLowerCase()
-    ) {
-      return res.status(400).json({ message: "Valid source warehouse is required" });
-    }
-
-    const sourceWarehouseKey = await resolveProductsWarehouseKey(sourceWarehouse);
-
-    if (!rawItems.length) {
-      return res.status(400).json({ message: "At least one product is required" });
-    }
-
-    const itemsByProductId = new Map<
-      string,
-      { productId: string; quantity: number; sellPrice?: number }
-    >();
-
-    for (const item of rawItems) {
-      const productId = String(item.productId || item.id || "");
-      const quantity = toNumber(item.quantity ?? item.qty);
-      const currentItem = itemsByProductId.get(productId);
-      const sellPrice =
-        item.sellPrice === undefined || item.sellPrice === ""
-          ? currentItem?.sellPrice
-          : toNumber(item.sellPrice);
-
-      if (!productId || quantity <= 0) {
-        throw new Error("Invalid load item");
-      }
-
-      itemsByProductId.set(productId, {
-        productId,
-        quantity: toNumber(currentItem?.quantity) + quantity,
-        sellPrice,
-      });
-    }
-
-    const items = Array.from(itemsByProductId.values());
-    const rootUpdates: Record<string, any> = {};
-    const now = new Date().toLocaleString();
-    const transferResults = [];
-    const targetSnapshot = await get(ref(database, `${PRODUCTS_PATH}/${vehicle.name}`));
-    const targetProducts = targetSnapshot.exists()
-      ? (targetSnapshot.val() as Record<string, Product>)
-      : {};
-
-    for (const item of items) {
-      const { productId, quantity } = item;
-
-      const sourceRef = ref(database, `${PRODUCTS_PATH}/${sourceWarehouseKey}/${productId}`);
-      const sourceSnapshot = await get(sourceRef);
-
-      if (!sourceSnapshot.exists()) {
-        throw new Error(`Product ${productId} not found in ${sourceWarehouse}`);
-      }
-
-      const sourceProduct = sourceSnapshot.val() as Product;
-      const sourceQuantity = toNumber(sourceProduct.quantity);
-      const sourceReserved = toNumber(sourceProduct.reservedQuantity);
-      const availableQuantity = sourceQuantity - sourceReserved;
-
-      if (quantity > availableQuantity) {
-        throw new Error(
-          `Insufficient quantity for ${sourceProduct.code}. Available: ${availableQuantity}, requested: ${quantity}`,
-        );
-      }
-
-      const targetEntry = Object.entries(targetProducts).find(
-        ([, product]) => product.code === sourceProduct.code,
-      );
-      const targetProductId =
-        targetEntry?.[0] || push(ref(database, `${PRODUCTS_PATH}/${vehicle.name}`)).key;
-
-      if (!targetProductId) {
-        throw new Error("Unable to create vehicle product key");
-      }
-
-      const existingTarget = targetEntry?.[1];
-      const requestedSellPrice = toNumber(item.sellPrice);
-      const existingSellPrice = toNumber(existingTarget?.sellPrice);
-      const sourceSellPrice = toNumber(sourceProduct.sellPrice);
-      const resolvedSellPrice =
-        requestedSellPrice > 0
-          ? requestedSellPrice
-          : existingSellPrice > 0
-            ? existingSellPrice
-            : sourceSellPrice;
-
-      if (resolvedSellPrice <= 0) {
-        throw new Error(`سعر المبيع مطلوب للمنتج ${sourceProduct.code}`);
-      }
-
-      const nextTargetProduct: Product = {
-        ...sourceProduct,
-        ...existingTarget,
-        id: targetProductId,
-        warehouse: vehicle.name,
-        quantity: toNumber(existingTarget?.quantity) + quantity,
-        reservedQuantity: toNumber(existingTarget?.reservedQuantity),
-        sellPrice: resolvedSellPrice,
-        updatedDate: now,
-      };
-
-      rootUpdates[
-        `${PRODUCTS_PATH}/${sourceWarehouseKey}/${productId}/quantity`
-      ] = sourceQuantity - quantity;
-      rootUpdates[
-        `${PRODUCTS_PATH}/${sourceWarehouseKey}/${productId}/updatedDate`
-      ] = now;
-      rootUpdates[`${PRODUCTS_PATH}/${vehicle.name}/${targetProductId}`] =
-        nextTargetProduct;
-      targetProducts[targetProductId] = nextTargetProduct;
-
-      transferResults.push({
-        productId,
-        code: sourceProduct.code,
-        name: sourceProduct.name,
-        quantity,
-        stockBefore: sourceQuantity,
-        stockAfter: sourceQuantity - quantity,
-      });
-    }
-
-    await update(ref(database), rootUpdates);
+    const requestId = String(req.body.requestId || randomUUID());
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(requestId)) throw new Error("Invalid load request id");
+    const input = {
+      vehicleId: req.params.id,
+      sourceWarehouseId: String(req.body.sourceWarehouseId || "").trim(),
+      sourceWarehouse: String(req.body.sourceWarehouse || "").trim(),
+      items: Array.isArray(req.body.items) ? req.body.items : [],
+      requestId,
+      note: String(req.body.note || "").trim().slice(0, 2000),
+    };
+    const context = { actorId: currentUser.userId, now: new Date().toISOString(), loadId: randomUUID(), fingerprint: createHash("sha256").update(JSON.stringify(input)).digest("hex") };
+    const root = ref(database);
+    const initialSnapshot = await get(root);
+    if (!initialSnapshot.exists()) throw new Error("Vehicle state not found");
+    const transaction = await runTransaction(root, (state) => applyVehicleLoad(state || initialSnapshot.val(), input, context), { applyLocally: false });
+    if (!transaction.committed) throw new Error("Vehicle loading could not be committed");
     resetProductsCache();
-
-    await Promise.all(
-      transferResults.map((transfer) =>
-        createTransferInternal({
-          productId: transfer.productId,
-          code: transfer.code,
-          name: transfer.name,
-          oldWarehouse: sourceWarehouse,
-          newWarehouse: vehicle.name,
-          quantity: transfer.quantity,
-          amount: 0,
-          currency: "USD",
-          stockBefore: transfer.stockBefore,
-          stockAfter: transfer.stockAfter,
-          performedBy: currentUser.username,
-          referenceId: `VEH-${Date.now()}`,
-          note: String(req.body.note || "Vehicle load"),
-        }),
-      ),
-    );
-
-    res.json({
-      message: "Vehicle loaded",
-      data: await summarizeVehicle(vehicle, todayKey()),
-    });
+    const vehicle = await getVehicleById(req.params.id);
+    if (!vehicle) throw new Error("Vehicle not found");
+    res.json({ message: "Vehicle loaded", data: await summarizeVehicle(vehicle, todayKey()) });
   } catch (error: any) {
-    console.error("Error loading vehicle:", error);
-    res.status(400).json({ message: error.message || "Failed to load vehicle" });
+    res.status(error.message === "UNAUTHORIZED" ? 401 : error.message === "FORBIDDEN" ? 403 : 400).json({ message: error.message || "Failed to load vehicle" });
   }
 };
 
 export const createMyVehicleSale = async (req: Request, res: Response) => {
   try {
-    const currentUser = getCurrentUserFromRequest(req);
+    const currentUser = await requireFinanceUser(req);
     if (!currentUser) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -934,6 +786,6 @@ export const createMyVehicleSale = async (req: Request, res: Response) => {
     res.json({ message: "Vehicle sale created", data: result });
   } catch (error: any) {
     console.error("Error creating vehicle sale:", error);
-    res.status(400).json({ message: error.message || "Failed to create vehicle sale" });
+    res.status(error.message === "UNAUTHORIZED" ? 401 : error.message === "FORBIDDEN" ? 403 : 400).json({ message: error.message || "Failed to create vehicle sale" });
   }
 };

@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import { Request, Response } from "express";
-import { ref, get, set, update, remove } from "firebase/database";
+import { ref, get, set, update, remove, runTransaction } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { Account } from "../types/account";
 import { normalizeCurrency, roundMoney, toMoneyNumber } from "../utils/money";
@@ -335,7 +335,8 @@ export const updateAccountBalanceInternal = async ({
     throw new Error("الحساب غير موجود");
   }
 
-  const account: Account = normalizeAccountBalances(snapshot.val());
+  const result = await runTransaction(accountRef, (current: Account | null) => {
+  const account: Account = normalizeAccountBalances(current || snapshot.val());
 
   if (!account.allowTransactions) {
     throw new Error("هذا الحساب لا يسمح بإجراء حركات عليه");
@@ -343,7 +344,7 @@ export const updateAccountBalanceInternal = async ({
 
   const numericAmount = Number(amount);
 
-  if (isNaN(numericAmount) || numericAmount <= 0) {
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
     throw new Error("قيمة الحركة يجب أن تكون أكبر من صفر");
   }
 
@@ -387,14 +388,10 @@ export const updateAccountBalanceInternal = async ({
     updatedAt: new Date().toISOString(),
   };
 
-  await update(accountRef, {
-    currentBalance: updatedAccount.currentBalance,
-    currentBalanceUSD: updatedAccount.currentBalanceUSD,
-    currentBalanceSYP: updatedAccount.currentBalanceSYP,
-    updatedAt: updatedAccount.updatedAt,
-  });
-
   return updatedAccount;
+  }, { applyLocally: false });
+  if (!result.committed) throw new Error("تعذر تحديث رصيد الحساب");
+  return result.snapshot.val() as Account;
 }
 
 const getCollectionValues = async (path: string) => {
@@ -449,6 +446,9 @@ export const getAccountDetails = async( req: Request , res : Response)=>{
           "payableAccountId",
           "salesAccountId",
           "expenseAccountId",
+          "partyAccountId",
+          "inventoryAccountId",
+          "differenceAccountId",
         ])
       ),
       purchases: (purchases as Record<string, any>[]).filter((item) =>

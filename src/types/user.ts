@@ -1,3 +1,5 @@
+import type { CommissionRateChange } from "./driverFinance";
+
 export interface InventoryUser {
   id?: string;
   username: string;
@@ -8,6 +10,9 @@ export interface InventoryUser {
   vehicleName?: string;
   createdAt?: string;
   updatedAt?: string;
+  commissionRate?: number;
+  commissionEffectiveFrom?: string;
+  commissionRateHistory?: CommissionRateChange[];
 }
 
 export interface InventoryUserResponse {
@@ -19,4 +24,7 @@ export interface InventoryUserResponse {
   vehicleName?: string;
   createdAt?: string;
   updatedAt?: string;
+  commissionRate?: number;
+  commissionEffectiveFrom?: string;
+  commissionRateHistory?: CommissionRateChange[];
 }

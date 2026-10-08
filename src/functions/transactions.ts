@@ -30,11 +30,14 @@ import { createTransferInternal } from "../controllers/transfer.controller";
 import { updateAccountBalanceInternal } from "../controllers/account.controller";
 import { createJournalEntryInternal } from "../controllers/journalEntries.controller";
 import { Payment } from "../types/payment";
+import { prepareDriverRefundPayments, prepareDriverPayment } from "../utils/driverCommission";
+import { applyCashPartySettlement } from "../utils/cashPartySettlement";
+import { randomUUID } from "crypto";
 import { Product, ProductPriceType } from "../types/product";
 import { purchase } from "../types/purchase";
 import { sell } from "../types/sell";
 import { database } from "../firebaseConfig";
-import { get, ref, update } from "firebase/database";
+import { get, ref, update, runTransaction } from "firebase/database";
 import {
   buildInvoiceMoneyBreakdown,
   buildPaymentMoneyBreakdown,
@@ -1030,6 +1033,10 @@ export const handleSell = async ({
     const sellToStore: sell = {
       ...newSell,
       products: productsForSell,
+      originalProducts: productsForSell.map((product) => ({ ...product })),
+      originalTotalUSD: sellMoney.totalUSD,
+      originalSubtotalUSD: sellMoney.subtotalUSD,
+      originalDiscountUSD: sellMoney.discountUSD,
       paymentStatus: sellStatus,
       currency: sellMoney.paymentCurrency,
       paymentCurrency: sellMoney.paymentCurrency,
@@ -1154,6 +1161,7 @@ export const handleSell = async ({
         type: "income",
         customerId: sellData.customerId,
         sellId: sellData.id,
+        ...(sellData.driverId ? { collectorId: sellData.driverId, vehicleId: sellData.vehicleId } : {}),
         paymentAccountId: sellData.paymentAccountId,
         receivableAccountId: sellData.receivableAccountId,
         salesAccountId: sellData.salesAccountId,
@@ -1172,6 +1180,7 @@ export const handleSell = async ({
         type: "income",
         customerId: sellData.customerId,
         sellId: sellData.id,
+        ...(sellData.driverId ? { collectorId: sellData.driverId, vehicleId: sellData.vehicleId } : {}),
         paymentAccountId: sellData.paymentAccountId,
         receivableAccountId: sellData.receivableAccountId,
         salesAccountId: sellData.salesAccountId,
@@ -1194,123 +1203,27 @@ export const handleSell = async ({
   }
 };
 
-export const customerPayment = async (paymentData: Payment) => {
-  const normalizedPayment = normalizePaymentForStorage(paymentData);
-  const updatedSell = await applyCustomerPaymentToSell(normalizedPayment);
-  const data = await createPaymentInternal(normalizedPayment);
-  const ledgerAmount = Math.abs(
-    toFiniteNumber(data.amountUSD, toFiniteNumber(data.amount)),
-  );
-  const paymentCurrency = normalizeCurrency(data.paymentCurrency || data.currency);
-  const paymentOriginalAmount = Math.abs(
-    toFiniteNumber(
-      data.amountOriginal,
-      toFiniteNumber(data.amount_base, ledgerAmount),
-    ),
-  );
-  const paymentSYPAmount =
-    paymentCurrency === "SYP"
-      ? Math.abs(toFiniteNumber(data.amountSYP, paymentOriginalAmount))
-      : 0;
-  const paymentLedgerEntries: LedgerEntry[] = [
-    {
-      accountId: data.paymentAccountId,
-      entryType: "debit",
-      amount: ledgerAmount,
-      currency: paymentCurrency,
-      exchangeRate: data.exchangeRate,
-      amountOriginal: paymentOriginalAmount,
-      amountSYP: paymentSYPAmount,
-    },
-    {
-      accountId: data.receivableAccountId,
-      entryType: "credit",
-      amount: ledgerAmount,
-      currency: paymentCurrency,
-      exchangeRate: data.exchangeRate,
-      amountOriginal: paymentOriginalAmount,
-      amountSYP: paymentSYPAmount,
-    },
-  ];
-
-  if (data.customerId) {
-    await updateCustomerInternal(data.customerId, undefined, data);
-  }
-
-  await postLedgerEntries(paymentLedgerEntries);
-
-  await createJournalEntryInternal({
-    date: data.date,
-    description: data.note || "قيد دفعة عميل",
-    referenceType: "payment",
-    referenceId: data.id,
-    lines: toJournalLines(
-      paymentLedgerEntries,
-      data.note || "قيد دفعة عميل"
-    ),
-  });
-
-  return { payment: data, sell: updatedSell };
+const settleCashPartyAtomic = async (paymentData: Payment) => {
+  const now = new Date().toISOString();
+  const payment = await prepareDriverPayment(normalizePaymentForStorage({
+    ...paymentData, id: randomUUID(), date: now, settlementMethod: "cash",
+  }));
+  const journalId = randomUUID();
+  const rootRef = ref(database);
+  const seed = await get(rootRef);
+  if (!seed.exists()) throw new Error("بيانات المشروع غير متاحة");
+  let output: ReturnType<typeof applyCashPartySettlement> | undefined;
+  const transaction = await runTransaction(rootRef, (current) => {
+    output = applyCashPartySettlement(current || seed.val(), payment, journalId);
+    return output.state;
+  }, { applyLocally: false });
+  if (!transaction.committed || !output) throw new Error("تعذر تسجيل الدفعة");
+  const { state: _state, ...result } = output;
+  return result;
 };
 
-export const supplierPayment = async (paymentData: Payment) => {
-  const normalizedPayment = normalizePaymentForStorage(paymentData);
-  const updatedPurchase = await applySupplierPaymentToPurchase(normalizedPayment);
-  const data = await createPaymentInternal(normalizedPayment);
-  const ledgerAmount = Math.abs(
-    toFiniteNumber(data.amountUSD, toFiniteNumber(data.amount)),
-  );
-  const paymentCurrency = normalizeCurrency(data.paymentCurrency || data.currency);
-  const paymentOriginalAmount = Math.abs(
-    toFiniteNumber(
-      data.amountOriginal,
-      toFiniteNumber(data.amount_base, ledgerAmount),
-    ),
-  );
-  const paymentSYPAmount =
-    paymentCurrency === "SYP"
-      ? Math.abs(toFiniteNumber(data.amountSYP, paymentOriginalAmount))
-      : 0;
-  const paymentLedgerEntries: LedgerEntry[] = [
-    {
-      accountId: data.payableAccountId,
-      entryType: "debit",
-      amount: ledgerAmount,
-      currency: paymentCurrency,
-      exchangeRate: data.exchangeRate,
-      amountOriginal: paymentOriginalAmount,
-      amountSYP: paymentSYPAmount,
-    },
-    {
-      accountId: data.paymentAccountId,
-      entryType: "credit",
-      amount: ledgerAmount,
-      currency: paymentCurrency,
-      exchangeRate: data.exchangeRate,
-      amountOriginal: paymentOriginalAmount,
-      amountSYP: paymentSYPAmount,
-    },
-  ];
-
-  if (data.supplierId) {
-    await updateSupplierInternal(data.supplierId, undefined, data);
-  }
-
-  await postLedgerEntries(paymentLedgerEntries);
-
-  await createJournalEntryInternal({
-    date: data.date,
-    description: data.note || "قيد دفعة مورد",
-    referenceType: "payment",
-    referenceId: data.id,
-    lines: toJournalLines(
-      paymentLedgerEntries,
-      data.note || "قيد دفعة مورد"
-    ),
-  });
-
-  return { payment: data, purchase: updatedPurchase };
-};
+export const customerPayment = (paymentData: Payment) => settleCashPartyAtomic(paymentData);
+export const supplierPayment = (paymentData: Payment) => settleCashPartyAtomic(paymentData);
 
 export const handleSupplierReturn = async (newReturn: {
   productCode: string;
@@ -1533,6 +1446,7 @@ export const handleCustomerReturn = async (newReturn: {
   paymentAccountId?: string;
   receivableAccountId?: string;
   salesAccountId?: string;
+  refundPaidByDriverId?: string;
 }) => {
   const returnQty = Math.abs(Number(newReturn.qty || 0));
   if (!returnQty) {
@@ -1734,6 +1648,7 @@ export const handleCustomerReturnSafe = async (newReturn: {
   paymentAccountId?: string;
   receivableAccountId?: string;
   salesAccountId?: string;
+  refundPaidByDriverId?: string;
 }) => {
   const returnType = (
     ["cash", "debt", "part"].includes(String(newReturn.returnType))
@@ -1824,7 +1739,15 @@ export const handleCustomerReturnSafe = async (newReturn: {
     throw new Error("Customer was not found");
   }
 
-  for (const returnedLine of calculation.returnedLines) {
+  let allocatedReturnCredit = 0;
+  let allocatedReturnCash = 0;
+  for (const [index, returnedLine] of calculation.returnedLines.entries()) {
+    const originalLine = originalSell.products.find((product) => product.id === returnedLine.productId && product.warehouse === returnedLine.warehouse);
+    const last = index === calculation.returnedLines.length - 1;
+    const credit = last ? roundMoney(calculation.receivableCreditUSD - allocatedReturnCredit) : roundMoney(calculation.receivableCreditUSD * returnedLine.netValueUSD / calculation.returnValueUSD);
+    const cash = last ? roundMoney(calculation.cashRefundUSD - allocatedReturnCash) : roundMoney(calculation.cashRefundUSD * returnedLine.netValueUSD / calculation.returnValueUSD);
+    allocatedReturnCredit = roundMoney(allocatedReturnCredit + credit);
+    allocatedReturnCash = roundMoney(allocatedReturnCash + cash);
     await createReturnInternal({
       productCode: returnedLine.code,
       productId: returnedLine.productId,
@@ -1834,26 +1757,32 @@ export const handleCustomerReturnSafe = async (newReturn: {
       type: "sale-return",
       referenceId: newReturn.referenceId,
       reason: newReturn.reason || "",
+      productName: originalLine?.name || "",
+      payPriceUSD: toMoneyNumber(originalLine?.payPrice),
+      sellPriceUSD: returnedLine.sellPrice,
+      ...(originalSell.driverId ? { driverId: originalSell.driverId } : {}),
+      ...(originalSell.vehicleId ? { vehicleId: originalSell.vehicleId } : {}),
+      cashRefundUSD: cash,
+      receivableCreditUSD: credit,
+      currency: calculation.paymentCurrency,
+      exchangeRate: calculation.exchangeRate,
     });
   }
 
   if (calculation.cashRefundUSD > 0) {
-    await createPaymentInternal(
+    const refunds = await prepareDriverRefundPayments(
+      newReturn.referenceId, calculation.cashRefundUSD,
+      calculation.paymentCurrency, calculation.exchangeRate, newReturn.refundPaidByDriverId,
+    );
+    for (const refund of refunds) await createPaymentInternal(
       stripUndefinedFields({
-        type: "return",
+        ...refund,
         customerId: newReturn.customerId,
+        sellId: newReturn.referenceId,
         paymentAccountId: newReturn.paymentAccountId,
         receivableAccountId: newReturn.receivableAccountId,
         salesAccountId: newReturn.salesAccountId,
-        amount: -calculation.cashRefundUSD,
-        amountUSD: -calculation.cashRefundUSD,
-        amountSYP: -calculation.cashRefundSYP,
-        amountOriginal: -calculation.cashRefundOriginal,
         note: `Customer return (${calculation.returnedLines.length} product line)`,
-        currency: calculation.paymentCurrency,
-        paymentCurrency: calculation.paymentCurrency,
-        exchangeRate: calculation.exchangeRate,
-        amount_base: -calculation.cashRefundOriginal,
       }) as Payment,
     );
   }
@@ -1972,6 +1901,8 @@ export const warehouseTransfer = async (transferData: {
       currency: transferData.currency,
       stockBefore: currentStock,
       stockAfter,
+      fromProductId: transferData.productId,
+      unitCostUSD: Number(product.product.payPrice || 0),
       performedBy: "admin",
       referenceId: `TR-${Date.now()}`,
       note: transferData.note,

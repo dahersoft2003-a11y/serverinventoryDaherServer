@@ -3,7 +3,7 @@ import { Supplier } from "../types/supplier";
 import { Request, Response } from "express";
 import { purchase } from "../types/purchase";
 import { Payment } from "../types/payment";
-import { ref, get, set, update, remove } from "firebase/database";
+import { ref, get, set, update, remove, runTransaction } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { Customer } from "../types/customer";
 import { normalizeCurrency, toMoneyNumber } from "../utils/money";
@@ -107,8 +107,9 @@ export const updateSupplierInternal = async (
   const snapshot = await get(supplierRef);
   if (!snapshot.exists()) return null;
 
-  const supplier = snapshot.val() as Supplier;
-  const now = new Date().toLocaleString();
+  const result = await runTransaction(supplierRef, (current: Supplier | null) => {
+  const supplier = current || snapshot.val() as Supplier;
+  const now = new Date().toISOString();
 
   if (sellUpdates) {
     const remainingUSD = toMoneyNumber(
@@ -134,7 +135,6 @@ export const updateSupplierInternal = async (
       purchases: [...(supplier.purchases || []), sellUpdates.id || ""],
       updatedDate: now,
     };
-    await set(supplierRef, updatedSupplier);
     return updatedSupplier;
   }
 
@@ -155,11 +155,12 @@ export const updateSupplierInternal = async (
         toMoneyNumber(paymentUpdates.balanceSYPChange),
       updatedDate: now,
     };
-    await set(supplierRef, updatedSupplier);
     return updatedSupplier;
   }
 
-  return null;
+  return supplier;
+  }, { applyLocally: false });
+  return result.committed ? result.snapshot.val() as Supplier : null;
 };
 
 // تحديث الرصيد داخليًا
@@ -269,7 +270,7 @@ export const getSupplierById = async (req: Request, res: Response) => {
         const invoicePayments = (paymentsByPurchase[purchaseData?.id] || [])
           .filter(
             (payment: any) =>
-              payment?.type === "expense" && toNumber(payment?.amount) < 0
+              (payment?.type === "expense" && toNumber(payment?.amount) < 0) || payment?.settlementMethod === "goods"
           )
           .sort(
             (a: any, b: any) =>
@@ -278,7 +279,7 @@ export const getSupplierById = async (req: Request, res: Response) => {
           );
         const invoicePaymentsTotal = invoicePayments.reduce(
           (sum: number, payment: any) =>
-            sum + Math.abs(toNumber(payment?.amount)),
+            sum + (payment?.settlementMethod === "goods" ? -toNumber(payment?.balanceUSDChange ?? payment?.amount) : Math.abs(toNumber(payment?.amount))),
           0
         );
         const paidAmount = Math.max(totalPrice - remainingDebt, 0);

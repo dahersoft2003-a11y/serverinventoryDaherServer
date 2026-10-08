@@ -12,6 +12,18 @@ export interface CurrentUser {
 const getStringValue = (value: unknown) =>
   typeof value === "string" && value.trim() ? value.trim() : "";
 
+const getHeaderStringValue = (value: unknown) => {
+  const headerValue = getStringValue(value);
+
+  if (!headerValue) return "";
+
+  try {
+    return decodeURIComponent(headerValue).trim();
+  } catch {
+    return headerValue;
+  }
+};
+
 export const sanitizeFirebaseKey = (key: string) =>
   key.replace(/[.#$\/\[\]]/g, "_");
 
@@ -60,10 +72,10 @@ export const getCurrentUserFromRequest = (req: Request): CurrentUser | null => {
     return tokenUser;
   }
 
-  const username = getStringValue(
+  const username = getHeaderStringValue(
     req.headers["x-inventory-username"] || req.headers["x-username"],
   );
-  const userId = getStringValue(
+  const userId = getHeaderStringValue(
     req.headers["x-inventory-user-id"] || req.headers["x-user-id"] || username,
   );
   const role = getStringValue(

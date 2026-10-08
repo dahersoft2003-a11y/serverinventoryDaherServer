@@ -89,7 +89,7 @@ export const deleteSell = async (req: Request, res: Response) => {
 export const createSellInternal = async (newSell: sell): Promise<sell> => {
   try {
     const id = uuidv4();
-    const NowDate = new Date().toLocaleString();
+    const NowDate = new Date().toISOString();
 
     const sellData: sell = stripUndefined({
       ...newSell,

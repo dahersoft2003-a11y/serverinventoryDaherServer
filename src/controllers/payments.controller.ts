@@ -5,6 +5,9 @@ import { ref, get, set, push } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { updateAccountBalanceInternal } from "./account.controller";
 import { createJournalEntryInternal } from "./journalEntries.controller";
+import { prepareDriverPayment } from "../utils/driverCommission";
+import { requireFinanceUser } from "../utils/financeAuth";
+import { sanitizeCashPaymentInput } from "../utils/cashPaymentInput";
 import {
   buildPaymentMoneyBreakdown,
   normalizeCurrency,
@@ -122,13 +125,18 @@ export const getMonthPayments = async (req: Request, res: Response) => {
 // ✅ إنشاء دفعة جديدة
 export const createPayment = async (req: Request, res: Response) => {
   try {
+    const actor = await requireFinanceUser(req);
+    if (actor.role !== "admin") return res.status(403).json({ error: "تسجيل هذه الدفعة متاح للمدير فقط" });
     const { newPayment }: { newPayment: Payment } = req.body;
 
     const id = uuidv4();
     const now = new Date().toISOString();
 
     const payment: Payment = normalizePaymentForStorage({
-      ...newPayment,
+      ...sanitizeCashPaymentInput(newPayment),
+      collectorId: actor.userId,
+      collectorName: actor.username,
+      createdBy: actor.userId,
       id,
       date: now,
     });
@@ -285,7 +293,7 @@ export const createPayment = async (req: Request, res: Response) => {
     res.status(201).json(payment);
   } catch (error: any) {
     console.error("Error creating payment:", error);
-    res.status(500).json({ error: "فشل في إنشاء الدفعة" });
+    res.status(error.message === "UNAUTHORIZED" ? 401 : 400).json({ error: error.message || "فشل في إنشاء الدفعة" });
   }
 };
 
@@ -296,11 +304,11 @@ export const createPaymentInternal = async (
   const id = uuidv4();
   const now = new Date().toISOString();
 
-  const payment: Payment = normalizePaymentForStorage({
+  const payment: Payment = await prepareDriverPayment(normalizePaymentForStorage({
     ...newPayment,
     id,
     date: now,
-  });
+  }));
 
   await set(ref(database, `payment/${id}`), payment);
   return payment;

@@ -3,9 +3,10 @@ import { Customer } from "../types/customer";
 import { Request, Response } from "express";
 import { sell } from "../types/sell";
 import { Payment } from "../types/payment";
-import { ref, get, set, update, remove } from "firebase/database";
+import { ref, get, set, update, remove, runTransaction } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { normalizeCurrency, roundMoney, toMoneyNumber } from "../utils/money";
+import { reconcileGoodsCustomerState } from "../utils/goodsSettlement";
 
 type CustomerBalanceReconciliation = {
   customer: Customer;
@@ -42,7 +43,7 @@ const getSaleRemainingSYP = (sale: Partial<sell>) => {
 };
 
 const shouldCountCustomerPaymentInBalance = (payment: Partial<Payment>) =>
-  payment.type === "income" && !payment.sellId;
+  !payment.sellId && (payment.type === "income" || payment.settlementMethod === "goods" || payment.type === "return-credit" || payment.type === "expense" && payment.balanceUSDChange !== undefined);
 
 export const reconcileCustomerBalanceInternal = async (
   id: string,
@@ -100,7 +101,7 @@ export const reconcileCustomerBalanceInternal = async (
     .reduce(
       (sum, payment) =>
         roundMoney(
-          sum + toMoneyNumber(payment.amountUSD, toMoneyNumber(payment.amount)),
+          sum + toMoneyNumber(payment.balanceUSDChange, toMoneyNumber(payment.amountUSD, toMoneyNumber(payment.amount))),
         ),
       0,
     );
@@ -138,10 +139,29 @@ export const reconcileCustomerBalanceInternal = async (
   };
 
   if (needsUpdate) {
-    await update(customerRef, {
-      ...patch,
-      updatedDate: reconciledCustomer.updatedDate,
-    });
+    // Recompute from the transaction's current invoices and payments. Applying
+    // the earlier read here could overwrite a concurrent goods settlement.
+    const rootRef = ref(database);
+    const seed = await get(rootRef);
+    const result = await runTransaction(rootRef, (current) => {
+      const source = current || seed.val();
+      if (!source?.customer?.[id]) return;
+      const state = { ...source, customer: { ...source.customer } };
+      reconcileGoodsCustomerState(state, id);
+      state.customer[id] = { ...state.customer[id], updatedDate: new Date().toISOString() };
+      return state;
+    }, { applyLocally: false });
+    if (!result.committed) return null;
+    const state = result.snapshot.val();
+    const actualCustomer = state.customer[id] as Customer;
+    return {
+      customer: actualCustomer,
+      purchases: Object.entries(state.sells || {}).map(([key, sale]: [string, any]) => ({ ...sale, id: sale.id || key }) as sell).filter((sale) => sale.customerId === id),
+      payments: Object.entries(state.payment || {}).map(([key, payment]: [string, any]) => ({ ...payment, id: payment.id || key }) as Payment).filter((payment) => payment.customerId === id),
+      removedPurchaseIds,
+      balanceUSD: toMoneyNumber(actualCustomer.balanceUSD, actualCustomer.balance),
+      balanceSYP: toMoneyNumber(actualCustomer.balanceSYP),
+    };
   }
 
   return {
@@ -252,59 +272,12 @@ export const updateCustomerInfo = async (
    ========================================================= */
 export const updateCustomerInternal = async (
   id: string,
-  sellUpdates?: sell,
-  payUpdates?: Payment
+  _sellUpdates?: sell,
+  _payUpdates?: Payment
 ): Promise<Customer | null> => {
-  const dbRef = ref(database, `customer/${id}`);
-  const snapshot = await get(dbRef);
-  if (!snapshot.exists()) return null;
-
-  const customer = snapshot.val() as Customer;
-  const now = new Date().toLocaleString();
-
-  let updatedCustomer: Customer = { ...customer, updatedDate: now };
-
-  if (sellUpdates) {
-    const remainingUSD = toMoneyNumber(
-      sellUpdates.remainingUSD,
-      toMoneyNumber(sellUpdates.remainingDebt),
-    );
-    const remainingSYP =
-      normalizeCurrency(sellUpdates.paymentCurrency || sellUpdates.currency) ===
-      "SYP"
-        ? toMoneyNumber(
-            sellUpdates.remainingSYP,
-            toMoneyNumber(sellUpdates.remainingOriginal),
-          )
-        : 0;
-    updatedCustomer.balance =
-      toMoneyNumber(customer.balance) - remainingUSD;
-    updatedCustomer.balanceUSD =
-      toMoneyNumber(customer.balanceUSD, toMoneyNumber(customer.balance)) -
-      remainingUSD;
-    updatedCustomer.balanceSYP =
-      toMoneyNumber(customer.balanceSYP) - remainingSYP;
-    updatedCustomer.purchases = [
-      ...(customer.purchases || []),
-      sellUpdates.id || "",
-    ];
-  } else if (payUpdates) {
-    const amountUSD = toMoneyNumber(
-      payUpdates.amountUSD,
-      toMoneyNumber(payUpdates.amount),
-    );
-    updatedCustomer.balance =
-      toMoneyNumber(customer.balance) + amountUSD;
-    updatedCustomer.balanceUSD =
-      toMoneyNumber(customer.balanceUSD, toMoneyNumber(customer.balance)) +
-      amountUSD;
-    updatedCustomer.balanceSYP =
-      toMoneyNumber(customer.balanceSYP) +
-      toMoneyNumber(payUpdates.balanceSYPChange);
-  }
-
-  await update(dbRef, updatedCustomer);
-  return (await reconcileCustomerBalanceInternal(id))?.customer || updatedCustomer;
+  // Callers have already saved their source invoice/payment. Derive the
+  // balance once rather than writing a stale delta then correcting it.
+  return (await reconcileCustomerBalanceInternal(id))?.customer || null;
 };
 
 /* =========================================================
@@ -383,7 +356,7 @@ export const getCustomerById = async (req: Request, res: Response) => {
       const invoicePayments = (paymentsBySell[sale?.id] || [])
         .filter(
           (payment: any) =>
-            payment?.type === "income" && toNumber(payment?.amount) > 0
+            (payment?.type === "income" && toNumber(payment?.amount) > 0) || payment?.settlementMethod === "goods"
         )
         .sort(
           (a: any, b: any) =>

@@ -1,11 +1,15 @@
 import { Request, Response } from "express";
-import { get, ref, remove, set, update } from "firebase/database";
+import { get, ref, remove, set, update, runTransaction } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { InventoryUser, InventoryUserResponse } from "../types/user";
-import { getCurrentUserFromRequest } from "../utils/currentUser";
+import { requireFinanceUser } from "../utils/financeAuth";
+import { commissionRateAt, financialDate, dayInDamascus } from "../utils/driverFinanceCalc";
+import { randomUUID } from "crypto";
 
 const USERS_PATH = "users";
 const INVALID_FIREBASE_KEY_CHARS = /[.#$\/\[\]]/;
+const ARABIC_USERNAME_CHAR_PATTERN =
+  /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/;
 
 const getTimestamp = () => new Date().toISOString();
 
@@ -33,15 +37,20 @@ const toUserResponse = (
   vehicleName: user.vehicleName,
   createdAt: user.createdAt,
   updatedAt: user.updatedAt,
+  commissionRate: commissionRateAt(user, getTimestamp()),
+  commissionEffectiveFrom: user.commissionEffectiveFrom,
+  commissionRateHistory: user.commissionRateHistory || [],
 });
 
 const isInvalidUsername = (username: string) =>
-  !username.trim() || INVALID_FIREBASE_KEY_CHARS.test(username);
+  !username.trim() || INVALID_FIREBASE_KEY_CHARS.test(username) || Object.prototype.hasOwnProperty.call(Object.prototype, username);
 
-const requireAdmin = (req: Request, res: Response) => {
-  const currentUser = getCurrentUserFromRequest(req);
+const hasArabicUsernameChars = (username: string) =>
+  ARABIC_USERNAME_CHAR_PATTERN.test(username);
 
-  if (!currentUser) {
+const requireAdmin = async (req: Request, res: Response) => {
+  let currentUser;
+  try { currentUser = await requireFinanceUser(req); } catch {
     res.status(401).json({ error: "Unauthorized" });
     return null;
   }
@@ -52,6 +61,20 @@ const requireAdmin = (req: Request, res: Response) => {
   }
 
   return currentUser;
+};
+
+const commissionUpdates = (body: any, existing: InventoryUser | undefined, actorId: string, now: string): Partial<InventoryUser> => {
+  if (body.commissionRateHistory !== undefined) throw new Error("سجل النسب يُنشأ على الخادم ولا يمكن تعديله مباشرة");
+  if (body.commissionRate === undefined) return {};
+  const rate = Number(body.commissionRate);
+  if (!Number.isFinite(rate) || rate < 0 || rate > 100) throw new Error("نسبة السائق يجب أن تكون بين 0 و100");
+  const effectiveFrom = body.commissionEffectiveFrom ? financialDate(body.commissionEffectiveFrom) : now;
+  if (!effectiveFrom || existing && dayInDamascus(effectiveFrom) < dayInDamascus(now)) throw new Error("لا يمكن تغيير النسبة بتاريخ قديم؛ اختر اليوم أو تاريخًا لاحقًا");
+  const history = Array.isArray(existing?.commissionRateHistory) ? [...existing!.commissionRateHistory!] : [];
+  if (existing && !history.length && existing.commissionRate !== undefined) history.push({ id: randomUUID(), rate: existing.commissionRate, effectiveFrom: financialDate(existing.commissionEffectiveFrom || existing.createdAt) || "1970-01-01T00:00:00.000Z", createdAt: now, createdBy: actorId });
+  const rateChange = { id: randomUUID(), rate, effectiveFrom, createdAt: now, createdBy: actorId };
+  history.push(rateChange);
+  return { commissionRate: rate, commissionEffectiveFrom: effectiveFrom, commissionRateHistory: history };
 };
 
 const getUserEntries = async () => {
@@ -66,7 +89,7 @@ const countAdmins = (users: Array<[string, InventoryUser]>) =>
   users.filter(([, user]) => normalizeRole(user.role) === "admin").length;
 
 export const getAllUsers = async (req: Request, res: Response) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
 
   try {
     const users = (await getUserEntries()).map(([key, user]) =>
@@ -81,7 +104,8 @@ export const getAllUsers = async (req: Request, res: Response) => {
 };
 
 export const createUser = async (req: Request, res: Response) => {
-  if (!requireAdmin(req, res)) return;
+  const currentUser = await requireAdmin(req, res);
+  if (!currentUser) return;
 
   const username =
     typeof req.body.username === "string" ? req.body.username.trim() : "";
@@ -100,6 +124,12 @@ export const createUser = async (req: Request, res: Response) => {
       error:
         "Username is required and cannot contain Firebase key characters: . # $ / [ ]",
     });
+  }
+
+  if (hasArabicUsernameChars(username)) {
+    return res
+      .status(400)
+      .json({ error: "Username cannot contain Arabic characters" });
   }
 
   if (!password.trim()) {
@@ -124,6 +154,7 @@ export const createUser = async (req: Request, res: Response) => {
       ...(vehicleName ? { vehicleName } : {}),
       createdAt: now,
       updatedAt: now,
+      ...commissionUpdates(req.body, undefined, currentUser.userId, now),
     };
 
     await set(dbRef, user);
@@ -134,12 +165,12 @@ export const createUser = async (req: Request, res: Response) => {
     });
   } catch (error: any) {
     console.error("Error creating user:", error);
-    res.status(500).json({ error: error.message });
+    res.status(400).json({ error: error.message });
   }
 };
 
 export const updateUser = async (req: Request, res: Response) => {
-  const currentUser = requireAdmin(req, res);
+  const currentUser = await requireAdmin(req, res);
   if (!currentUser) return;
 
   const { id } = req.params;
@@ -188,6 +219,7 @@ export const updateUser = async (req: Request, res: Response) => {
             ? normalizePermissions(existingUser.permissions)
             : normalizePermissions(req.body.permissions),
       updatedAt: getTimestamp(),
+      ...commissionUpdates(req.body, existingUser, currentUser.userId, getTimestamp()),
     };
 
     if (req.body.vehicleId !== undefined) {
@@ -218,13 +250,14 @@ export const updateUser = async (req: Request, res: Response) => {
       updates.password = req.body.password;
     }
 
-    await update(dbRef, updates);
-
-    const updatedUser: InventoryUser = {
-      ...existingUser,
-      ...updates,
-      username: existingUser.username || id,
-    };
+    const rateUpdatedAt = getTimestamp();
+    const transaction = await runTransaction(dbRef, (current: InventoryUser | null) => current ? {
+      ...current, ...updates,
+      ...commissionUpdates(req.body, current, currentUser.userId, rateUpdatedAt),
+      username: current.username || id,
+    } : current, { applyLocally: false });
+    if (!transaction.committed || !transaction.snapshot.exists()) throw new Error("تعذر تثبيت تحديث المستخدم");
+    const updatedUser = transaction.snapshot.val() as InventoryUser;
 
     res.json({
       message: "User updated successfully",
@@ -232,12 +265,12 @@ export const updateUser = async (req: Request, res: Response) => {
     });
   } catch (error: any) {
     console.error("Error updating user:", error);
-    res.status(500).json({ error: error.message });
+    res.status(400).json({ error: error.message });
   }
 };
 
 export const deleteUser = async (req: Request, res: Response) => {
-  const currentUser = requireAdmin(req, res);
+  const currentUser = await requireAdmin(req, res);
   if (!currentUser) return;
 
   const { id } = req.params;

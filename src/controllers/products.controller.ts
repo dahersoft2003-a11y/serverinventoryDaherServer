@@ -11,6 +11,7 @@ import {
 } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { getCurrentUserFromRequest } from "../utils/currentUser";
+import { calculateReservationStock } from "../utils/reservationStock";
 
 let productsCache: any = null;
 let lastFetch = 0;
@@ -657,6 +658,26 @@ export const assertProductAvailableForSellInternal = async (
   return normalizedProduct;
 };
 
+const transactReservedStock = async (
+  productId: string,
+  warehouse: string,
+  change: Parameters<typeof calculateReservationStock>[1],
+): Promise<Product> => {
+  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
+  const snapshot = await get(productRef);
+  if (!snapshot.exists()) throw new Error("Product not found");
+  const seed: Product = snapshot.val();
+  const updatedDate = new Date().toISOString();
+  const result = await runTransaction(productRef, (current: Product | null) => {
+    const product = current || seed;
+    return { ...calculateReservationStock(product, change), updatedDate };
+  }, { applyLocally: false });
+  if (!result.committed) throw new Error("Product reservation update was aborted");
+  fetchReset();
+  return result.snapshot.val() as Product;
+};
+
 export const reserveProductQuantityInternal = async (
   productId: string,
   warehouse: string,
@@ -664,39 +685,11 @@ export const reserveProductQuantityInternal = async (
 ): Promise<Product> => {
   const reserveQty = Number(quantityToReserve || 0);
 
-  if (!productId || !warehouse || reserveQty <= 0) {
+  if (!productId || !warehouse || !Number.isFinite(reserveQty) || reserveQty <= 0) {
     throw new Error("Invalid reservation quantity");
   }
 
-  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
-  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
-  const snapshot = await get(productRef);
-
-  if (!snapshot.exists()) {
-    throw new Error("Product not found");
-  }
-
-  const product: Product = snapshot.val();
-  const currentQuantity = Number(product.quantity || 0);
-  const currentReserved = Number(product.reservedQuantity || 0);
-  const availableQuantity = currentQuantity - currentReserved;
-
-  if (availableQuantity < reserveQty) {
-    throw new Error(
-      `Insufficient available quantity. Available: ${availableQuantity}, requested: ${reserveQty}`,
-    );
-  }
-
-  const updatedProduct: Product = {
-    ...product,
-    reservedQuantity: currentReserved + reserveQty,
-    updatedDate: new Date().toLocaleString(),
-  };
-
-  await set(productRef, updatedProduct);
-  fetchReset();
-
-  return updatedProduct;
+  return transactReservedStock(productId, warehouse, { type: "reserve", quantity: reserveQty });
 };
 
 export const releaseReservedQuantityInternal = async (
@@ -706,37 +699,11 @@ export const releaseReservedQuantityInternal = async (
 ): Promise<Product> => {
   const releaseQty = Number(quantityToRelease || 0);
 
-  if (!productId || !warehouse || releaseQty <= 0) {
+  if (!productId || !warehouse || !Number.isFinite(releaseQty) || releaseQty <= 0) {
     throw new Error("Invalid reserved quantity release");
   }
 
-  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
-  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
-  const snapshot = await get(productRef);
-
-  if (!snapshot.exists()) {
-    throw new Error("Product not found");
-  }
-
-  const product: Product = snapshot.val();
-  const currentReserved = Number(product.reservedQuantity || 0);
-
-  if (releaseQty > currentReserved) {
-    throw new Error(
-      `Reserved quantity is lower than requested release. Reserved: ${currentReserved}, release: ${releaseQty}`,
-    );
-  }
-
-  const updatedProduct: Product = {
-    ...product,
-    reservedQuantity: Math.max(currentReserved - releaseQty, 0),
-    updatedDate: new Date().toLocaleString(),
-  };
-
-  await set(productRef, updatedProduct);
-  fetchReset();
-
-  return updatedProduct;
+  return transactReservedStock(productId, warehouse, { type: "release", quantity: releaseQty });
 };
 
 export const settleReservedQuantityOnSellInternal = async (
@@ -748,7 +715,7 @@ export const settleReservedQuantityOnSellInternal = async (
   const soldQty = Number(soldQuantity || 0);
   const releaseQty = Number(reservedQuantityToRelease || 0);
 
-  if (!productId || !warehouse || soldQty < 0 || releaseQty <= 0) {
+  if (!productId || !warehouse || !Number.isFinite(soldQty) || !Number.isFinite(releaseQty) || soldQty < 0 || releaseQty <= 0) {
     throw new Error("Invalid reserved stock settlement");
   }
 
@@ -756,41 +723,7 @@ export const settleReservedQuantityOnSellInternal = async (
     throw new Error("Used quantity cannot exceed reserved quantity");
   }
 
-  const warehouseKey = await resolveProductsWarehouseKey(warehouse);
-  const productRef = ref(database, `products/${warehouseKey}/${productId}`);
-  const snapshot = await get(productRef);
-
-  if (!snapshot.exists()) {
-    throw new Error("Product not found");
-  }
-
-  const product: Product = snapshot.val();
-  const currentQuantity = Number(product.quantity || 0);
-  const currentReserved = Number(product.reservedQuantity || 0);
-
-  if (releaseQty > currentReserved) {
-    throw new Error(
-      `Reserved quantity is lower than requested release. Reserved: ${currentReserved}, release: ${releaseQty}`,
-    );
-  }
-
-  if (soldQty > currentQuantity) {
-    throw new Error(
-      `Insufficient quantity. Quantity: ${currentQuantity}, requested: ${soldQty}`,
-    );
-  }
-
-  const updatedProduct: Product = {
-    ...product,
-    quantity: currentQuantity - soldQty,
-    reservedQuantity: Math.max(currentReserved - releaseQty, 0),
-    updatedDate: new Date().toLocaleString(),
-  };
-
-  await set(productRef, updatedProduct);
-  fetchReset();
-
-  return updatedProduct;
+  return transactReservedStock(productId, warehouse, { type: "settle", quantity: releaseQty, soldQuantity: soldQty });
 };
 
 export const updateProduct = async (req: Request, res: Response) => {
@@ -809,38 +742,30 @@ export const updateProduct = async (req: Request, res: Response) => {
     for (const warehouse in warehouses) {
       for (const productId in warehouses[warehouse]) {
         if (productId === id) {
-          const newData = {
-            ...warehouses[warehouse][productId],
-            ...updatedFields,
-            quantity:
-              updatedFields.quantity === undefined
-                ? Number(warehouses[warehouse][productId].quantity || 0)
-                : Number(updatedFields.quantity || 0),
-            reservedQuantity:
-              updatedFields.reservedQuantity === undefined
-                ? Number(
-                    warehouses[warehouse][productId].reservedQuantity || 0,
-                  )
-                : Number(updatedFields.reservedQuantity || 0),
-            updatedDate: new Date().toLocaleString(),
-          };
-
-          if ("alertQuantity" in updatedFields) {
-            const alertQuantity = normalizeAlertQuantity(updatedFields.alertQuantity);
-
-            if (alertQuantity === undefined) {
-              delete newData.alertQuantity;
-            } else {
-              newData.alertQuantity = alertQuantity;
+          const seed: Product = warehouses[warehouse][productId];
+          const updatedDate = new Date().toISOString();
+          const result = await runTransaction(ref(database, `products/${warehouse}/${productId}`), (current: Product | null) => {
+            const product = current || seed;
+            const newData: Product = {
+              ...product,
+              ...updatedFields,
+              quantity: updatedFields.quantity === undefined ? Number(product.quantity || 0) : Number(updatedFields.quantity || 0),
+              reservedQuantity: updatedFields.reservedQuantity === undefined ? Number(product.reservedQuantity || 0) : Number(updatedFields.reservedQuantity || 0),
+              updatedDate,
+            };
+            if (!Number.isFinite(newData.quantity) || newData.quantity < 0 || !Number.isFinite(newData.reservedQuantity) || Number(newData.reservedQuantity) < 0 || Number(newData.reservedQuantity) > newData.quantity) {
+              throw new Error("Invalid product stock or reserved quantity");
             }
-          }
-
-          await set(
-            ref(database, `products/${warehouse}/${productId}`),
-            newData,
-          );
-
-          return res.json({ message: "تم تحديث المنتج", data: newData });
+            if ("alertQuantity" in updatedFields) {
+              const alertQuantity = normalizeAlertQuantity(updatedFields.alertQuantity);
+              if (alertQuantity === undefined) delete newData.alertQuantity;
+              else newData.alertQuantity = alertQuantity;
+            }
+            return newData;
+          }, { applyLocally: false });
+          if (!result.committed) throw new Error("Product update was aborted");
+          fetchReset();
+          return res.json({ message: "تم تحديث المنتج", data: result.snapshot.val() });
         }
       }
     }
@@ -907,31 +832,31 @@ export const createOrUpdateProductInternal = async (
 
       if (existingProduct.code === newProduct.code) {
         const alertQuantity = normalizeAlertQuantity(newProduct.alertQuantity);
-        // تحديث المنتج
-        const updatedProduct: Product = {
-          ...existingProduct,
-          ...newProduct,
-          warehouse: warehouseName,
-          quantity:
-            Number(existingProduct.quantity || 0) +
-            Number(newProduct.quantity || 0),
-          reservedQuantity: Number(existingProduct.reservedQuantity || 0),
-          updatedDate: NowDate,
-          id: productId, // مهم جداً: المفتاح من الـ DB
-        };
-
-        updatedProduct.alertQuantity =
-          alertQuantity === undefined
-            ? existingProduct.alertQuantity
-            : alertQuantity;
-
-        // حفظ التحديث
-        await set(
-          ref(database, `${warehousePath}/${productId}`),
-          updatedProduct,
-        );
+        const addedQuantity = Number(newProduct.quantity || 0);
+        if (!Number.isFinite(addedQuantity) || addedQuantity < 0) throw new Error("Invalid purchase stock quantity");
+        const result = await runTransaction(ref(database, `${warehousePath}/${productId}`), (current: Product | null) => {
+          const product = current || existingProduct;
+          if (product.code !== newProduct.code) throw new Error("Product code changed during purchase");
+          const quantity = Number(product.quantity || 0);
+          const reservedQuantity = Number(product.reservedQuantity || 0);
+          if (!Number.isFinite(quantity) || quantity < 0 || !Number.isFinite(reservedQuantity) || reservedQuantity < 0) throw new Error("Invalid product stock or reserved quantity");
+          const updatedProduct: Product = {
+            ...product,
+            ...newProduct,
+            warehouse: warehouseName,
+            quantity: quantity + addedQuantity,
+            reservedQuantity,
+            updatedDate: NowDate,
+            id: productId,
+          };
+          const nextAlert = alertQuantity === undefined ? product.alertQuantity : alertQuantity;
+          if (nextAlert === undefined) delete updatedProduct.alertQuantity;
+          else updatedProduct.alertQuantity = nextAlert;
+          return updatedProduct;
+        }, { applyLocally: false });
+        if (!result.committed) throw new Error("Purchase product merge was aborted");
         fetchReset();
-        return updatedProduct;
+        return result.snapshot.val() as Product;
       }
     }
   }

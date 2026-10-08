@@ -20,6 +20,7 @@ import materialReservationsRouter from "./materialReservations.routes";
 import quotationsRouter from "./quotations.routes";
 import vehiclesRouter from "./vehicles.routes";
 import currencyMigrationRouter from "./currencyMigration.routes";
+import driverStatementsRouter from "./driverStatements.routes";
 
 
 const router = Router();
@@ -46,6 +47,7 @@ router.use("/material-reservations", materialReservationsRouter);
 router.use("/quotations", quotationsRouter);
 router.use("/vehicles", vehiclesRouter);
 router.use("/currency-migration", currencyMigrationRouter);
+router.use("/driver-statements", driverStatementsRouter);
 
 
 export default router;
