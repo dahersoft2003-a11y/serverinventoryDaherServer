@@ -6,6 +6,7 @@ import { endExchange } from "../controllers/exchange.controller";
 import { createGoodsPayment, cancelGoodsPayment } from "../controllers/goodsPayments.controller";
 import { requireFinanceUser } from "../utils/financeAuth";
 import { sanitizeCashPaymentInput } from "../utils/cashPaymentInput";
+import { assertCashPaymentAccess, cashPaymentHttpError } from "../utils/cashPaymentAccess";
 
 const router = express.Router();
 
@@ -64,7 +65,7 @@ router.post("/endExchange", endExchange);
 router.post("/customerPayment", async (req: Request, res: Response) => {
   try {
     const actor = await requireFinanceUser(req);
-    if (actor.role !== "admin") return res.status(403).json({ message: "استخدم تسجيل تحصيل السائق لدفعات عهدته" });
+    assertCashPaymentAccess(actor, "customer");
     const { paymentData } = req.body;
     if (!paymentData) {
       throw new Error("❌ بيانات الدفع غير مكتملة");
@@ -72,22 +73,24 @@ router.post("/customerPayment", async (req: Request, res: Response) => {
     const result = await customerPayment({ ...sanitizeCashPaymentInput(paymentData), collectorId: actor.userId, collectorName: actor.username, createdBy: actor.userId });
     res.json({ message: "✅ تمت عملية الدفع", data: result });
   } catch (error: any) {
-    res.status(400).json({ message: error.message });
+    const response = cashPaymentHttpError(error);
+    res.status(response.status).json({ message: response.message });
   }
 });
 
 router.post("/supplierPayment", async (req: Request, res: Response) => {
   try {
     const actor = await requireFinanceUser(req);
-    if (actor.role !== "admin") return res.status(403).json({ message: "تسجيل دفعات المورد متاح للمدير فقط" });
+    assertCashPaymentAccess(actor, "supplier");
     const { paymentData } = req.body;
     if (!paymentData) {
       throw new Error("❌ بيانات الدفع غير مكتملة");
     }
-    const result = await supplierPayment({ ...sanitizeCashPaymentInput(paymentData), createdBy: actor.userId });
+    const result = await supplierPayment({ ...sanitizeCashPaymentInput(paymentData), collectorId: actor.userId, collectorName: actor.username, createdBy: actor.userId });
     res.json({ message: "✅ تمت عملية الدفع", data: result });
   } catch (error: any) {
-    res.status(400).json({ message: error.message });
+    const response = cashPaymentHttpError(error);
+    res.status(response.status).json({ message: response.message });
   }
 });
 

@@ -69,6 +69,14 @@ test("USD tender against SYP invoice decreases AR original currency at the invoi
   assert.equal(r.sell.remainingSYP, 800000); assert.equal(r.state.accounts.ar.currentBalanceSYP, 800000); assert.equal(r.state.accounts.cash.currentBalanceSYP, 0);
 });
 
+test("cash against legacy SYR invoices keeps customer original-currency debt after reconciliation", () => {
+  const s = fixture(); s.sells.s.currency = "SYR"; s.sells.s.exchangeRate = 10000; s.sells.s.remainingSYP = 1000000;
+  s.customer.c.balanceSYP = -1000000; s.accounts.ar.currentBalanceSYP = 1000000;
+  const r = applyCashPartySettlement(s, cash(), "journal1");
+  assert.equal(r.sell.remainingSYP, 800000); assert.equal(r.state.customer.c.balanceSYP, -800000);
+  reconcileGoodsCustomerState(r.state, "c"); assert.equal(r.state.customer.c.balanceSYP, -800000);
+});
+
 test("atomic validation failure leaves input invoice, accounts, payments and parties unchanged", () => {
   const s = fixture(); const before = JSON.stringify(s);
   assert.throws(() => applyCashPartySettlement(s, cash({ amountUSD: 200 }), "journal1"), /المتبقي/);
@@ -125,4 +133,24 @@ test("cash input strips forged collector, commission, reversal and goods metadat
 test("money normalization uses tender originals and preserves signed SYP payment", () => {
   const money = buildPaymentMoneyBreakdown({ amount: -99, amountUSD: -99, amountOriginal: -400000, currency: "SYP", exchangeRate: 20000 });
   assert.equal(money.amountUSD, -20); assert.equal(money.amountSYP, -400000); assert.equal(money.amountOriginal, -400000);
+});
+
+test("direct supplier cash receipt increases its balance toward zero without touching an invoice", () => {
+  const s = fixture(); s.supplier.u.balanceUSD = -100; s.supplier.u.balance = -100;
+  const r = applyCashPartySettlement(s, supplierCash({ purchaseId: undefined, amount: 20, amountUSD: 20, amountOriginal: 20, amount_base: 20 }), "journal1");
+  assert.equal(r.state.supplier.u.balanceUSD, -80); assert.equal(r.payment.type, "income");
+  assert.equal(r.state.accounts.cash.currentBalanceUSD, 1020); assert.equal(r.state.purchases.b.remainingDebt, 100);
+  journalBalanced(r.state, "journal1");
+});
+
+test("cash request retry returns the saved receipt without another journal, balance or invoice change", () => {
+  const request = { requestKey: "cash_request", fingerprint: "same-request" };
+  const first = applyCashPartySettlement(fixture(), cash({ requestId: "cash-request-1" }), "journal1", request);
+  const before = JSON.stringify(first.state);
+  const retry = applyCashPartySettlement(first.state, cash({ id: "retry-id", requestId: "cash-request-1" }), "retry-journal", request);
+  assert.equal(retry.duplicate, true); assert.equal(retry.payment.id, "cash1"); assert.equal(retry.sell.remainingDebt, 80);
+  assert.equal(Object.keys(retry.state.payment).length, 1); assert.equal(Object.keys(retry.state.journalEntries).length, 1);
+  assert.equal(JSON.stringify(retry.state), before);
+  assert.throws(() => applyCashPartySettlement(first.state, cash({ id: "retry-id" }), "retry-journal", { ...request, fingerprint: "changed-value" }), /دفعة مختلفة/);
+  assert.equal(JSON.stringify(first.state), before);
 });

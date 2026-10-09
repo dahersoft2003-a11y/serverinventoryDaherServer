@@ -32,7 +32,8 @@ import { createJournalEntryInternal } from "../controllers/journalEntries.contro
 import { Payment } from "../types/payment";
 import { prepareDriverRefundPayments, prepareDriverPayment } from "../utils/driverCommission";
 import { applyCashPartySettlement } from "../utils/cashPartySettlement";
-import { randomUUID } from "crypto";
+import { normalizeCashPaymentMoney } from "../utils/cashPaymentInput";
+import { createHash, randomUUID } from "crypto";
 import { Product, ProductPriceType } from "../types/product";
 import { purchase } from "../types/purchase";
 import { sell } from "../types/sell";
@@ -1203,18 +1204,30 @@ export const handleSell = async ({
   }
 };
 
-const settleCashPartyAtomic = async (paymentData: Payment) => {
+const settleCashPartyAtomic = async (paymentData: Payment, partyType: "customer" | "supplier") => {
+  if (partyType === "customer" ? !paymentData.customerId || paymentData.supplierId : !paymentData.supplierId || paymentData.customerId) throw new Error("نوع الطرف لا يطابق مسار الدفعة");
   const now = new Date().toISOString();
-  const payment = await prepareDriverPayment(normalizePaymentForStorage({
-    ...paymentData, id: randomUUID(), date: now, settlementMethod: "cash",
-  }));
+  const normalized = normalizeCashPaymentMoney(paymentData);
+  const payment: Payment = {
+    ...normalized, id: randomUUID(), date: now, settlementMethod: "cash", collectionSource: "management",
+    commissionRate: 0, commissionUSD: 0, commissionOriginal: 0,
+  };
+  const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+  const request = payment.requestId ? {
+    requestKey: `cash_${hash(`${payment.createdBy || ""}:${payment.requestId}`)}`,
+    fingerprint: hash(JSON.stringify({ partyType, customerId: payment.customerId, supplierId: payment.supplierId,
+      sellId: payment.sellId, purchaseId: payment.purchaseId, paymentAccountId: payment.paymentAccountId,
+      receivableAccountId: payment.receivableAccountId, payableAccountId: payment.payableAccountId,
+      currency: payment.currency, exchangeRate: payment.exchangeRate, amountOriginal: payment.amountOriginal,
+      note: payment.note || "" })),
+  } : undefined;
   const journalId = randomUUID();
   const rootRef = ref(database);
   const seed = await get(rootRef);
   if (!seed.exists()) throw new Error("بيانات المشروع غير متاحة");
   let output: ReturnType<typeof applyCashPartySettlement> | undefined;
   const transaction = await runTransaction(rootRef, (current) => {
-    output = applyCashPartySettlement(current || seed.val(), payment, journalId);
+    output = applyCashPartySettlement(current || seed.val(), payment, journalId, request);
     return output.state;
   }, { applyLocally: false });
   if (!transaction.committed || !output) throw new Error("تعذر تسجيل الدفعة");
@@ -1222,8 +1235,8 @@ const settleCashPartyAtomic = async (paymentData: Payment) => {
   return result;
 };
 
-export const customerPayment = (paymentData: Payment) => settleCashPartyAtomic(paymentData);
-export const supplierPayment = (paymentData: Payment) => settleCashPartyAtomic(paymentData);
+export const customerPayment = (paymentData: Payment) => settleCashPartyAtomic(paymentData, "customer");
+export const supplierPayment = (paymentData: Payment) => settleCashPartyAtomic(paymentData, "supplier");
 
 export const handleSupplierReturn = async (newReturn: {
   productCode: string;

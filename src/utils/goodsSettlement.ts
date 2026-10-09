@@ -1,6 +1,6 @@
 import { GoodsPaymentItem, Payment } from "../types/payment";
 import { JournalEntry, JournalEntryLine } from "../types/journalEntry";
-import { normalizeExchangeRate, originalToUSD, roundMoney, toMoneyNumber, usdToOriginal } from "./money";
+import { normalizeCurrency, normalizeExchangeRate, originalToUSD, roundMoney, toMoneyNumber, usdToOriginal } from "./money";
 
 export interface GoodsPaymentInput {
   requestId: string;
@@ -164,7 +164,7 @@ export const reconcileGoodsCustomerState = (state: FinanceState, customerId: str
   const sells = Object.entries(state.sells || {}).map(([id, sale]: [string, any]) => ({ ...sale, id: sale.id || id })).filter((sale) => sale.customerId === customerId);
   const direct = values(state.payment).filter((payment) => payment.customerId === customerId && !payment.sellId && (payment.settlementMethod === "goods" || payment.type === "income" || payment.type === "return-credit" || payment.type === "expense" && payment.balanceUSDChange !== undefined));
   const balanceUSD = roundMoney(-sells.reduce((sum, sale) => sum + toMoneyNumber(sale.remainingUSD, toMoneyNumber(sale.remainingDebt)), 0) + direct.reduce((sum, payment) => sum + toMoneyNumber(payment.balanceUSDChange, toMoneyNumber(payment.amountUSD, toMoneyNumber(payment.amount))), 0));
-  const balanceSYP = roundMoney(-sells.reduce((sum, sale) => sum + ((sale.paymentCurrency || sale.currency) === "SYP" ? toMoneyNumber(sale.remainingSYP, toMoneyNumber(sale.remainingOriginal)) : 0), 0) + direct.reduce((sum, payment) => sum + toMoneyNumber(payment.balanceSYPChange, toMoneyNumber(payment.amountSYP)), 0));
+  const balanceSYP = roundMoney(-sells.reduce((sum, sale) => sum + (normalizeCurrency(sale.paymentCurrency || sale.currency) === "SYP" ? toMoneyNumber(sale.remainingSYP, toMoneyNumber(sale.remainingOriginal)) : 0), 0) + direct.reduce((sum, payment) => sum + toMoneyNumber(payment.balanceSYPChange, toMoneyNumber(payment.amountSYP)), 0));
   state.customer[customerId] = { ...customer, balance: balanceUSD, balanceUSD, balanceSYP, purchases: sells.map((sale) => sale.id).filter(Boolean) };
 };
 

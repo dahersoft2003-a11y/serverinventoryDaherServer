@@ -3,9 +3,18 @@ import { JournalEntryLine } from "../types/journalEntry";
 import { applyFinanceJournal, FinanceState, reconcileGoodsCustomerState } from "./goodsSettlement";
 import { normalizeCurrency, normalizeExchangeRate, roundMoney, toMoneyNumber, usdToOriginal } from "./money";
 
+export interface CashRequestContext { requestKey: string; fingerprint: string }
+
 /** Keeps legacy cash receipts atomic with newly introduced goods settlements. */
-export const applyCashPartySettlement = (original: FinanceState, payment: Payment, journalId: string) => {
+export const applyCashPartySettlement = (original: FinanceState, payment: Payment, journalId: string, request?: CashRequestContext) => {
   const state: FinanceState = JSON.parse(JSON.stringify(original));
+  const previous = request && state.financialRequests?.[request.requestKey];
+  if (previous) {
+    if (previous.fingerprint !== request.fingerprint) throw new Error("معرف الطلب مستخدم لدفعة مختلفة");
+    const saved = state.payment?.[previous.paymentId] as Payment;
+    if (!saved) throw new Error("سجل الدفعة السابقة غير مكتمل");
+    return { state, payment: saved, ...(saved.sellId ? { sell: state.sells?.[saved.sellId] } : saved.purchaseId ? { purchase: state.purchases?.[saved.purchaseId] } : {}), duplicate: true };
+  }
   const invalidKey = (key: string) => !key || /[.#$\/\[\]]/.test(key) || Object.prototype.hasOwnProperty.call(Object.prototype, key);
   if (!payment.id || invalidKey(payment.id) || invalidKey(journalId) || payment.settlementMethod === "goods" || state.payment?.[payment.id]) throw new Error("سند نقدي صالح وفريد مطلوب");
   if (Boolean(payment.customerId) === Boolean(payment.supplierId)) throw new Error("اختر طرفًا واحدًا للدفعة");
@@ -69,5 +78,9 @@ export const applyCashPartySettlement = (original: FinanceState, payment: Paymen
   else state.supplier[partyId] = { ...party, balance: roundMoney(toMoneyNumber(party.balanceUSD, party.balance) + signedAmount), balanceUSD: roundMoney(toMoneyNumber(party.balanceUSD, party.balance) + signedAmount), balanceSYP: roundMoney(toMoneyNumber(party.balanceSYP) + toMoneyNumber(row.balanceSYPChange)), updatedDate: payment.date };
   const line = (accountId: string, debit: number, credit: number, lineCurrency = currency, lineRate = exchangeRate, lineOriginal = originalAmount): JournalEntryLine => ({ accountId, accountName: state.accounts[accountId].name || accountId, debit, credit, currency: lineCurrency, exchangeRate: lineRate, amountUSD: amount, amountOriginal: lineOriginal, amountSYP: lineCurrency === "SYP" ? lineOriginal : 0 });
   applyFinanceJournal(state, { id: journalId, date: payment.date || new Date().toISOString(), description: payment.note || "دفعة على حساب الطرف", referenceId: payment.id, referenceType: "payment", createdBy: payment.createdBy || "", lines: [line(cashAccountId, positive ? amount : 0, positive ? 0 : amount), line(partyAccountId, positive ? 0 : amount, positive ? amount : 0, partyCurrency, partyRate, partyOriginal)] });
+  if (request) {
+    state.financialRequests ||= {};
+    state.financialRequests[request.requestKey] = { paymentId: payment.id, fingerprint: request.fingerprint };
+  }
   return { state, payment: row, ...(customer ? { sell: invoice } : { purchase: invoice }) };
 };
