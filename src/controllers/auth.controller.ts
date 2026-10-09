@@ -14,7 +14,14 @@ const normalizePermissions = (permissions: unknown): string[] => {
 };
 
 export const login = async (req: Request, res: Response) => {
-  const { username, password } = req.body;
+  const username = typeof req.body?.username === "string" ? req.body.username.trim() : "";
+  const password = req.body?.password;
+
+  if (!username || /[.#$\/\[\]]/.test(username) ||
+      Object.prototype.hasOwnProperty.call(Object.prototype, username) ||
+      typeof password !== "string" || !password) {
+    return res.status(400).json({ error: "أدخل اسم مستخدم وكلمة مرور صالحين" });
+  }
 
   try {
     const dbRef = ref(database, `users/${username}`);
@@ -32,18 +39,21 @@ export const login = async (req: Request, res: Response) => {
 
     const userRole = user.role || "user";
     const permissions = normalizePermissions(user.permissions);
-    const currentUsername = user.username || username;
+    const userId = snapshot.key || username;
+    const currentUsername = typeof user.username === "string" && user.username.trim()
+      ? user.username.trim()
+      : userId;
 
     return res.json({
       message: "تم تسجيل الدخول بنجاح",
       token: generateToken({
-        userId: currentUsername,
+        userId,
         username: currentUsername,
         role: userRole,
         permissions,
       }),
       user: {
-        id: username,
+        id: userId,
         username: currentUsername,
         role: userRole,
         permissions,
