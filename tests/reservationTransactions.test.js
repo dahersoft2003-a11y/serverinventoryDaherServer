@@ -55,13 +55,13 @@ test('reservation callback rejects a request that only the stale snapshot can fu
   assert.equal(latest.quantity, 10);
   assert.equal(latest.reservedQuantity, 2);
 });
-test('purchase merge adds quantity to the latest stock and preserves current reservations', async () => {
+test('purchase merge adds quantity to the latest stock and averages cost without changing reservations', async () => {
   seed = { id: 'p1', code: 'P1', warehouse: 'W', quantity: 20, reservedQuantity: 2, payPrice: 4 };
   latest = { ...seed, quantity: 10, reservedQuantity: 7, payPrice: 4.8 };
   const result = await createOrUpdateProductInternal({ code: 'P1', warehouse: 'W', name: 'صنف', quantity: 5, payPrice: 6 });
   assert.equal(result.quantity, 15);
   assert.equal(result.reservedQuantity, 7);
-  assert.equal(result.payPrice, 6);
+  assert.equal(result.payPrice, 5.2);
   assert.equal(result.id, 'p1');
   assert.equal('alertQuantity' in result, false);
 });

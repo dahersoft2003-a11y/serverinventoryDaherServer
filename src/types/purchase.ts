@@ -1,6 +1,7 @@
 
 export interface purchase {
     id: string,
+    requestId?: string,
     supplierId: string,
     name: string,
     code: string,

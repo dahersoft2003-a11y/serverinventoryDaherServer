@@ -2,6 +2,7 @@ import type { ProductPriceType } from "./product";
 
 export interface sell {
   id?: string;
+  requestId?: string;
   customerId: string;
   totalPrice: number;
   paymentStatus: "cash" | "part" | "debt";

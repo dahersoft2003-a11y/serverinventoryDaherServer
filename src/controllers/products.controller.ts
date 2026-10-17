@@ -12,6 +12,7 @@ import {
 import { database } from "../firebaseConfig";
 import { getCurrentUserFromRequest } from "../utils/currentUser";
 import { calculateReservationStock } from "../utils/reservationStock";
+import { weightedPurchaseCost } from "../utils/productCost";
 
 let productsCache: any = null;
 let lastFetch = 0;
@@ -521,6 +522,77 @@ export const create = async (req: Request, res: Response) => {
   }
 };
 
+// Add a product to the catalogue without recording stock or a purchase.
+export const createCatalogProduct = async (req: Request, res: Response) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const code = String(req.body?.code || "").trim();
+    const category = String(req.body?.category || "").trim();
+    const warehouse = normalizeWarehouseName(req.body?.warehouse);
+    const unit = String(req.body?.unit || "").trim();
+
+    if (!name || !code || !category || !warehouse || !unit) {
+      return res.status(400).json({ message: "اسم المنتج ورمزه وصنفه ومستودعه ووحدته مطلوبة" });
+    }
+
+    const prices = Object.fromEntries(
+      priceFields.map((field) => [field, Number(req.body?.[field] ?? 0)]),
+    ) as Record<(typeof priceFields)[number], number>;
+    const alertQuantity = Number(req.body?.alertQuantity ?? 5);
+    if (
+      Object.values(prices).some((price) => !Number.isFinite(price) || price < 0) ||
+      !Number.isFinite(alertQuantity) || alertQuantity < 0
+    ) {
+      return res.status(400).json({ message: "الأسعار وحد التنبيه يجب أن تكون أرقامًا غير سالبة" });
+    }
+
+    const warehouseKey = await resolveProductsWarehouseKey(warehouse);
+    const warehouseRef = ref(database, `products/${warehouseKey}`);
+    const productId = push(warehouseRef).key;
+    if (!productId) throw new Error("Could not create product ID");
+
+    const productData: Product = {
+      id: productId,
+      name,
+      code,
+      category,
+      warehouse,
+      unit,
+      ...prices,
+      alertQuantity,
+      quantity: 0,
+      reservedQuantity: 0,
+      updatedDate: new Date().toLocaleString(),
+    };
+
+    let duplicate = false;
+    const result = await runTransaction(
+      warehouseRef,
+      (current: Record<string, Product> | null) => {
+        const products = current || {};
+        duplicate = Object.values(products).some(
+          (product) => String(product?.code || "").trim().toLowerCase() === code.toLowerCase(),
+        );
+        if (duplicate) return;
+        return { ...products, [productId]: productData };
+      },
+      { applyLocally: false },
+    );
+
+    if (!result.committed) {
+      return res.status(duplicate ? 409 : 500).json({
+        message: duplicate ? "رمز المنتج موجود مسبقًا في هذا المستودع" : "تعذر حفظ المنتج",
+      });
+    }
+
+    fetchReset();
+    return res.status(201).json({ message: "تمت إضافة المنتج إلى القائمة", data: productData });
+  } catch (error) {
+    console.error("Error creating catalogue product:", error);
+    return res.status(500).json({ message: "حدث خطأ أثناء إضافة المنتج إلى القائمة" });
+  }
+};
+
 // ✅ تحديث كمية المنتج بعد بيع داخليًا
 export const adjustProductQuantityInternal = async (
   productId: string,
@@ -746,11 +818,15 @@ export const updateProduct = async (req: Request, res: Response) => {
           const updatedDate = new Date().toISOString();
           const result = await runTransaction(ref(database, `products/${warehouse}/${productId}`), (current: Product | null) => {
             const product = current || seed;
+            if (updatedFields.quantity !== undefined && Number(updatedFields.quantity) !== Number(product.quantity || 0) ||
+                updatedFields.reservedQuantity !== undefined && Number(updatedFields.reservedQuantity) !== Number(product.reservedQuantity || 0)) {
+              throw new Error("تغيير رصيد المنتج يتطلب عملية شراء أو بيع أو تسوية مخزون");
+            }
             const newData: Product = {
               ...product,
               ...updatedFields,
-              quantity: updatedFields.quantity === undefined ? Number(product.quantity || 0) : Number(updatedFields.quantity || 0),
-              reservedQuantity: updatedFields.reservedQuantity === undefined ? Number(product.reservedQuantity || 0) : Number(updatedFields.reservedQuantity || 0),
+              quantity: Number(product.quantity || 0),
+              reservedQuantity: Number(product.reservedQuantity || 0),
               updatedDate,
             };
             if (!Number.isFinite(newData.quantity) || newData.quantity < 0 || !Number.isFinite(newData.reservedQuantity) || Number(newData.reservedQuantity) < 0 || Number(newData.reservedQuantity) > newData.quantity) {
@@ -846,6 +922,9 @@ export const createOrUpdateProductInternal = async (
             warehouse: warehouseName,
             quantity: quantity + addedQuantity,
             reservedQuantity,
+            payPrice: newProduct.payPrice === undefined
+              ? product.payPrice
+              : weightedPurchaseCost(quantity, Number(product.payPrice || 0), addedQuantity, Number(newProduct.payPrice)),
             updatedDate: NowDate,
             id: productId,
           };

@@ -1,10 +1,11 @@
 
 import express from 'express';
-import { getAll, create, getProductById, updateProduct, deleteProduct, getByWarehouse , bulkUpdatePrices } from '../controllers/products.controller';
+import { getAll, createCatalogProduct, getProductById, updateProduct, deleteProduct, getByWarehouse , bulkUpdatePrices } from '../controllers/products.controller';
 const router = express.Router();
 
 router.get('/', getAll);
-router.post('/', create);
+router.post('/', createCatalogProduct);
+router.post('/catalog', createCatalogProduct);
 
 router.put("/:id", updateProduct);
 router.delete("/:id", deleteProduct);

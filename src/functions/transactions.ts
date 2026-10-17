@@ -9,6 +9,7 @@ import {
   assertProductAvailableForSellInternal,
   createOrUpdateProductInternal,
   getProductByIdInternal,
+  resetProductsCache,
   updateQuantityOnSell,
 } from "../controllers/products.controller";
 import {
@@ -55,6 +56,8 @@ import {
   CustomerReturnType,
   SaleReturnLineInput,
 } from "../utils/saleReturn";
+import { applyProductPurchaseSettlement } from "../utils/productPurchaseSettlement";
+import { applyProductSaleSettlement } from "../utils/productSaleSettlement";
 
 type SellStockUpdater = (product: sell["products"][number]) => Promise<void>;
 
@@ -639,23 +642,27 @@ export const handlePurchase = async ({
   newPurchase: purchase;
   newProduct: Product;
 }) => {
+  const quantity = Number(newProduct.quantity);
+  const price = Number(newProduct.payPrice);
+  if (!newProduct.id || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0) {
+    throw new Error("اختر منتجًا موجودًا وكمية وسعر شراء صحيحين");
+  }
+  const expectedTotal = roundMoney(quantity * price);
+  if (!Number.isFinite(expectedTotal) || expectedTotal <= 0 || roundMoney(Number(newPurchase.totalPrice)) !== expectedTotal) {
+    throw new Error("إجمالي الفاتورة لا يطابق الكمية وسعر الشراء");
+  }
+  if (!["cash", "part", "debt"].includes(newPurchase.paymentStatus) || !["USD", "SYP"].includes(newPurchase.currency)) {
+    throw new Error("حالة الدفع أو العملة غير صالحة");
+  }
   const purchaseStatus = normalizePaymentStatus(newPurchase.paymentStatus);
-  const submittedTotal = toFiniteNumber(
-    newPurchase.totalPrice,
-    toFiniteNumber(newPurchase.payPrice) * toFiniteNumber(newPurchase.quantity),
-  );
   const purchaseMoney = buildMoneyFromSubmittedInvoice({
-    totalUSD: submittedTotal,
+    totalUSD: expectedTotal,
     paymentStatus: purchaseStatus,
     currency: newPurchase.currency,
     exchangeRate: newPurchase.exchangeRate,
     partValue: newPurchase.partValue ?? newPurchase.amount_base,
     remainingDebt: newPurchase.remainingDebt,
   });
-
-  if (purchaseMoney.totalUSD <= 0) {
-    throw new Error("Purchase invoice total must be greater than zero");
-  }
 
   if (
     purchaseStatus === "part" &&
@@ -665,9 +672,40 @@ export const handlePurchase = async ({
       "Partial purchase payment must be greater than zero and less than invoice total",
     );
   }
+  const paidOriginal = purchaseStatus === "part"
+    ? roundMoney(Number(newPurchase.partValue))
+    : purchaseMoney.paidOriginal;
+  const remainingOriginal = roundMoney(purchaseMoney.totalOriginal - paidOriginal);
+  if (!Number.isFinite(paidOriginal) || paidOriginal < 0 || remainingOriginal < 0 ||
+      purchaseStatus === "part" && (paidOriginal <= 0 || remainingOriginal <= 0) ||
+      purchaseStatus === "cash" && paidOriginal !== purchaseMoney.totalOriginal ||
+      purchaseStatus === "debt" && paidOriginal !== 0 ||
+      roundMoney(originalToUSD(paidOriginal, purchaseMoney.paymentCurrency, purchaseMoney.exchangeRate)) !== purchaseMoney.paidUSD) {
+    throw new Error("مبلغ الدفع لا يطابق حالة فاتورة الشراء");
+  }
 
-  const purchaseData = await createPurchaseInternal({
+  const purchaseId = randomUUID();
+  const context = {
+    purchaseId,
+    productId: newProduct.id,
+    paymentId: randomUUID(),
+    journalId: randomUUID(),
+    requestKey: `product_purchase_${newPurchase.requestId || purchaseId}`,
+    fingerprint: createHash("sha256").update(JSON.stringify({ newPurchase, newProduct })).digest("hex"),
+    now: new Date().toISOString(),
+  };
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(String(newPurchase.requestId || purchaseId))) {
+    throw new Error("معرف طلب الشراء غير صالح");
+  }
+  const purchaseData: purchase = {
     ...newPurchase,
+    id: purchaseId,
+    date: context.now,
+    name: newProduct.name,
+    code: newProduct.code,
+    warehouse: newProduct.warehouse,
+    quantity,
+    payPrice: price,
     paymentStatus: purchaseStatus,
     currency: purchaseMoney.paymentCurrency,
     paymentCurrency: purchaseMoney.paymentCurrency,
@@ -679,88 +717,32 @@ export const handlePurchase = async ({
     totalSYP: purchaseMoney.totalSYP,
     totalOriginal: purchaseMoney.totalOriginal,
     paidUSD: purchaseMoney.paidUSD,
-    paidSYP: purchaseMoney.paidSYP,
-    paidOriginal: purchaseMoney.paidOriginal,
+    paidSYP: purchaseMoney.paymentCurrency === "SYP" ? paidOriginal : 0,
+    paidOriginal,
     remainingDebt: purchaseMoney.remainingUSD,
     remainingUSD: purchaseMoney.remainingUSD,
-    remainingSYP: purchaseMoney.remainingSYP,
-    remainingOriginal: purchaseMoney.remainingOriginal,
-    partValue: purchaseMoney.paidOriginal,
-  });
+    remainingSYP: purchaseMoney.paymentCurrency === "SYP" ? remainingOriginal : 0,
+    remainingOriginal,
+    partValue: paidOriginal,
+  };
 
-  await createOrUpdateProductInternal(newProduct);
-  await updateSupplierInternal(purchaseData.supplierId, purchaseData);
-
-  const paidAmount = toFiniteNumber(
-    purchaseData.paidUSD,
-    purchaseData.totalPrice - purchaseData.remainingDebt,
-  );
-  const purchaseLedgerEntries: LedgerEntry[] = [
-    {
-      accountId: purchaseData.inventoryAccountId,
-      entryType: "debit",
-      amount: purchaseData.totalPrice,
-      currency: purchaseMoney.paymentCurrency,
-      exchangeRate: purchaseMoney.exchangeRate,
-      amountOriginal: purchaseMoney.totalOriginal,
-      amountSYP: purchaseMoney.totalSYP,
-    },
-    {
-      accountId: purchaseData.paymentAccountId,
-      entryType: "credit",
-      amount: paidAmount,
-      currency: purchaseMoney.paymentCurrency,
-      exchangeRate: purchaseMoney.exchangeRate,
-      amountOriginal: purchaseMoney.paidOriginal,
-      amountSYP: purchaseMoney.paidSYP,
-    },
-    {
-      accountId: purchaseData.payableAccountId,
-      entryType: "credit",
-      amount: purchaseData.remainingDebt,
-      currency: purchaseMoney.paymentCurrency,
-      exchangeRate: purchaseMoney.exchangeRate,
-      amountOriginal: purchaseMoney.remainingOriginal,
-      amountSYP: purchaseMoney.remainingSYP,
-    },
-  ];
-
-  await postLedgerEntries(purchaseLedgerEntries);
-
-  await createJournalEntryInternal({
-    date: purchaseData.date,
-    description: `قيد شراء ${purchaseData.name || purchaseData.code}`,
-    referenceType: "purchase",
-    referenceId: purchaseData.id,
-    lines: toJournalLines(
-        purchaseLedgerEntries,
-      `قيد شراء ${purchaseData.name || purchaseData.code}`
-    ),
-  });
-
-  if (paidAmount > 0) {
-    await createPaymentInternal({
-      type: "expense",
-      supplierId: purchaseData.supplierId,
-      purchaseId: purchaseData.id,
-      paymentAccountId: purchaseData.paymentAccountId,
-      payableAccountId: purchaseData.payableAccountId,
-      amount: -paidAmount,
-      amountUSD: -paidAmount,
-      amountSYP: -purchaseMoney.paidSYP,
-      amountOriginal: -purchaseMoney.paidOriginal,
-      note:
-        purchaseData.remainingDebt === 0
-          ? `${newProduct.name} دفع كامل ثمن شراء`
-          : `${newProduct.name} دفعة من ثمن شراء`,
-      currency: purchaseData.currency,
-      paymentCurrency: purchaseData.paymentCurrency,
-      exchangeRate: purchaseData.exchangeRate,
-      amount_base: -purchaseMoney.paidOriginal,
-    });
-  }
-
-  return purchaseData;
+  const rootRef = ref(database);
+  const seed = await get(rootRef);
+  let transactionError: Error | null = null;
+  const result = await runTransaction(rootRef, (current: any) => {
+    try {
+      transactionError = null;
+      return applyProductPurchaseSettlement(current || seed.val() || {}, purchaseData, newProduct, context).state;
+    } catch (error: any) {
+      transactionError = error;
+      return;
+    }
+  }, { applyLocally: false });
+  if (!result.committed) throw transactionError || new Error("تعذر إتمام الشراء");
+  resetProductsCache?.();
+  const state = result.snapshot.val();
+  const savedId = state.financialRequests?.[context.requestKey]?.purchaseId || purchaseId;
+  return state.purchases[savedId] as purchase;
 };
 
 export const handleBulkPurchase = async ({
@@ -768,22 +750,43 @@ export const handleBulkPurchase = async ({
 }: {
   newPurchase: purchase;
 }) => {
-  const products = Array.isArray(newPurchase.products)
-    ? newPurchase.products
-    : [];
-
-  if (!products.length) {
-    throw new Error("Purchase invoice must include at least one product");
+  const products = Array.isArray(newPurchase.products) ? newPurchase.products : [];
+  if (!products.length || products.length > 200) {
+    throw new Error("فاتورة الشراء تحتاج بين منتج واحد و200 منتج");
   }
-
-  const totalPrice = products.reduce(
-    (sum, product) =>
-      sum +
-      Number(product.lineTotal || Number(product.payPrice || 0) * Number(product.quantity || 0)),
-    0
-  );
+  const items: Product[] = products.map((product) => ({
+    id: product.id,
+    name: product.name,
+    code: product.code,
+    category: product.category,
+    warehouse: product.warehouse,
+    unit: product.unit,
+    quantity: Number(product.quantity),
+    payPrice: Number(product.payPrice),
+    wholesalePrice: product.wholesalePrice === undefined ? undefined : Number(product.wholesalePrice),
+    superWholesalePrice: product.superWholesalePrice === undefined ? undefined : Number(product.superWholesalePrice),
+    sellPrice: product.sellPrice === undefined ? undefined : Number(product.sellPrice),
+    alertQuantity: product.alertQuantity,
+  }));
+  let rawTotal = 0;
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    const lineTotal = item.quantity * Number(item.payPrice);
+    if (!item.id || !Number.isFinite(lineTotal) || lineTotal <= 0 ||
+        productLineTotalMismatch(products[index].lineTotal, lineTotal)) {
+      throw new Error("أحد أسطر فاتورة الشراء غير صالح");
+    }
+    rawTotal += lineTotal;
+  }
+  const totalPrice = roundMoney(rawTotal);
+  if (roundMoney(Number(newPurchase.totalPrice)) !== totalPrice) {
+    throw new Error("إجمالي الفاتورة لا يطابق أسعار وكميات المنتجات");
+  }
+  if (!["cash", "part", "debt"].includes(newPurchase.paymentStatus) || !["USD", "SYP"].includes(newPurchase.currency)) {
+    throw new Error("حالة الدفع أو العملة غير صالحة");
+  }
   const purchaseStatus = normalizePaymentStatus(newPurchase.paymentStatus);
-  const purchaseMoney = buildMoneyFromSubmittedInvoice({
+  const money = buildMoneyFromSubmittedInvoice({
     totalUSD: totalPrice,
     paymentStatus: purchaseStatus,
     currency: newPurchase.currency,
@@ -791,154 +794,81 @@ export const handleBulkPurchase = async ({
     partValue: newPurchase.partValue ?? newPurchase.amount_base,
     remainingDebt: newPurchase.remainingDebt,
   });
-
-  if (purchaseMoney.totalUSD <= 0) {
-    throw new Error("Purchase invoice total must be greater than zero");
+  const paidOriginal = purchaseStatus === "part"
+    ? roundMoney(Number(newPurchase.partValue))
+    : money.paidOriginal;
+  const remainingOriginal = roundMoney(money.totalOriginal - paidOriginal);
+  if (!Number.isFinite(paidOriginal) || paidOriginal < 0 || remainingOriginal < 0 ||
+      purchaseStatus === "part" && (money.paidUSD <= 0 || money.remainingUSD <= 0 || paidOriginal <= 0 || remainingOriginal <= 0) ||
+      roundMoney(originalToUSD(paidOriginal, money.paymentCurrency, money.exchangeRate)) !== money.paidUSD) {
+    throw new Error("المدفوع والمتبقي لا يطابقان الفاتورة");
   }
-
-  if (
-    purchaseStatus === "part" &&
-    (purchaseMoney.paidUSD <= 0 || purchaseMoney.paidUSD >= purchaseMoney.totalUSD)
-  ) {
-    throw new Error(
-      "Partial purchase payment must be greater than zero and less than invoice total",
-    );
+  const purchaseId = randomUUID();
+  const context = {
+    purchaseId,
+    productId: "",
+    paymentId: randomUUID(),
+    journalId: randomUUID(),
+    requestKey: `product_purchase_${newPurchase.requestId || purchaseId}`,
+    fingerprint: createHash("sha256").update(JSON.stringify({ newPurchase, items })).digest("hex"),
+    now: new Date().toISOString(),
+  };
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(String(newPurchase.requestId || purchaseId))) {
+    throw new Error("معرف طلب الشراء غير صالح");
   }
-
-  const purchaseData = await createPurchaseInternal({
+  const purchaseData: purchase = {
     ...newPurchase,
-    name: newPurchase.name || `Purchase invoice (${products.length})`,
+    id: purchaseId,
+    date: context.now,
+    name: newPurchase.name || `فاتورة شراء (${items.length})`,
     code: newPurchase.code || `PINV-${Date.now()}`,
-    warehouse:
-      newPurchase.warehouse ||
-      Array.from(new Set(products.map((product) => product.warehouse))).join(", "),
-    quantity:
-      newPurchase.quantity ||
-      products.reduce((sum, product) => sum + Number(product.quantity || 0), 0),
-    payPrice: newPurchase.payPrice || 0,
+    warehouse: Array.from(new Set(items.map((item) => item.warehouse))).join(", "),
+    quantity: items.reduce((sum, item) => sum + item.quantity, 0),
+    payPrice: 0,
     paymentStatus: purchaseStatus,
-    currency: purchaseMoney.paymentCurrency,
-    paymentCurrency: purchaseMoney.paymentCurrency,
-    priceCurrency: purchaseMoney.priceCurrency,
-    exchangeRate: purchaseMoney.exchangeRate,
-    totalPrice: purchaseMoney.totalUSD,
-    amount_base: purchaseMoney.totalOriginal,
-    totalUSD: purchaseMoney.totalUSD,
-    totalSYP: purchaseMoney.totalSYP,
-    totalOriginal: purchaseMoney.totalOriginal,
-    paidUSD: purchaseMoney.paidUSD,
-    paidSYP: purchaseMoney.paidSYP,
-    paidOriginal: purchaseMoney.paidOriginal,
-    remainingDebt: purchaseMoney.remainingUSD,
-    remainingUSD: purchaseMoney.remainingUSD,
-    remainingSYP: purchaseMoney.remainingSYP,
-    remainingOriginal: purchaseMoney.remainingOriginal,
-    partValue: purchaseMoney.paidOriginal,
-    products: products.map((product) => ({
-      ...product,
-      lineTotal:
-        product.lineTotal ||
-        Number(product.payPrice || 0) * Number(product.quantity || 0),
-    })),
-  });
-
-  for (const product of products) {
-    await createOrUpdateProductInternal({
-      id: product.id || "",
-      name: product.name,
-      code: product.code,
-      category: product.category,
-      warehouse: product.warehouse,
-      payPrice: Number(product.payPrice || 0),
-      wholesalePrice: Number(product.wholesalePrice || 0),
-      superWholesalePrice: Number(product.superWholesalePrice || 0),
-      sellPrice: Number(product.sellPrice || 0),
-      unit: product.unit,
-      quantity: Number(product.quantity || 0),
-      alertQuantity:
-        product.alertQuantity === undefined
-          ? undefined
-          : Number(product.alertQuantity || 0),
-      updatedDate: "",
-    });
-  }
-
-  await updateSupplierInternal(purchaseData.supplierId, purchaseData);
-
-  const paidAmount = toFiniteNumber(
-    purchaseData.paidUSD,
-    purchaseData.totalPrice - purchaseData.remainingDebt,
-  );
-  const note = `قيد فاتورة شراء ${purchaseData.code}`;
-
-  const purchaseLedgerEntries: LedgerEntry[] = [
-    {
-      accountId: purchaseData.inventoryAccountId,
-      entryType: "debit",
-      amount: purchaseData.totalPrice,
-      currency: purchaseMoney.paymentCurrency,
-      exchangeRate: purchaseMoney.exchangeRate,
-      amountOriginal: purchaseMoney.totalOriginal,
-      amountSYP: purchaseMoney.totalSYP,
-    },
-    {
-      accountId: purchaseData.paymentAccountId,
-      entryType: "credit",
-      amount: paidAmount,
-      currency: purchaseMoney.paymentCurrency,
-      exchangeRate: purchaseMoney.exchangeRate,
-      amountOriginal: purchaseMoney.paidOriginal,
-      amountSYP: purchaseMoney.paidSYP,
-    },
-    {
-      accountId: purchaseData.payableAccountId,
-      entryType: "credit",
-      amount: purchaseData.remainingDebt,
-      currency: purchaseMoney.paymentCurrency,
-      exchangeRate: purchaseMoney.exchangeRate,
-      amountOriginal: purchaseMoney.remainingOriginal,
-      amountSYP: purchaseMoney.remainingSYP,
-    },
-  ];
-
-  await postLedgerEntries(purchaseLedgerEntries);
-
-  await createJournalEntryInternal({
-    date: purchaseData.date,
-    description: note,
-    referenceType: "purchase",
-    referenceId: purchaseData.id,
-    lines: toJournalLines(
-      purchaseLedgerEntries,
-      note
-    ),
-  });
-
-  if (paidAmount > 0) {
-    await createPaymentInternal({
-      type: "expense",
-      supplierId: purchaseData.supplierId,
-      purchaseId: purchaseData.id,
-      paymentAccountId: purchaseData.paymentAccountId,
-      payableAccountId: purchaseData.payableAccountId,
-      amount: -paidAmount,
-      amountUSD: -paidAmount,
-      amountSYP: -purchaseMoney.paidSYP,
-      amountOriginal: -purchaseMoney.paidOriginal,
-      note:
-        purchaseData.remainingDebt === 0
-          ? "دفع كامل ثمن فاتورة شراء"
-          : "دفعة من ثمن فاتورة شراء",
-      currency: purchaseData.currency,
-      paymentCurrency: purchaseData.paymentCurrency,
-      exchangeRate: purchaseData.exchangeRate,
-      amount_base: -purchaseMoney.paidOriginal,
-    });
-  }
-
-  return purchaseData;
+    currency: money.paymentCurrency,
+    paymentCurrency: money.paymentCurrency,
+    priceCurrency: money.priceCurrency,
+    exchangeRate: money.exchangeRate,
+    totalPrice: money.totalUSD,
+    amount_base: money.totalOriginal,
+    totalUSD: money.totalUSD,
+    totalSYP: money.totalSYP,
+    totalOriginal: money.totalOriginal,
+    paidUSD: money.paidUSD,
+    paidSYP: money.paymentCurrency === "SYP" ? paidOriginal : 0,
+    paidOriginal,
+    remainingDebt: money.remainingUSD,
+    remainingUSD: money.remainingUSD,
+    remainingSYP: money.paymentCurrency === "SYP" ? remainingOriginal : 0,
+    remainingOriginal,
+    partValue: paidOriginal,
+    products: items.map((item) => ({
+      ...item,
+      lineTotal: item.quantity * Number(item.payPrice),
+    })) as purchase["products"],
+  };
+  const rootRef = ref(database);
+  const seed = await get(rootRef);
+  let transactionError: Error | null = null;
+  const result = await runTransaction(rootRef, (current: any) => {
+    try {
+      transactionError = null;
+      return applyProductPurchaseSettlement(current || seed.val() || {}, purchaseData, items, context).state;
+    } catch (error: any) {
+      transactionError = error;
+      return;
+    }
+  }, { applyLocally: false });
+  if (!result.committed) throw transactionError || new Error("تعذر إتمام فاتورة الشراء");
+  resetProductsCache?.();
+  const state = result.snapshot.val();
+  const savedId = state.financialRequests?.[context.requestKey]?.purchaseId || purchaseId;
+  return state.purchases[savedId] as purchase;
 };
 
+const productLineTotalMismatch = (submitted: unknown, calculated: number) =>
+  submitted !== undefined && roundMoney(Number(submitted)) !== roundMoney(calculated);
 export const handleSell = async ({
   newSell,
   stockUpdater,
@@ -946,6 +876,34 @@ export const handleSell = async ({
   newSell: sell;
   stockUpdater?: SellStockUpdater;
 }) => {
+  if (!stockUpdater) {
+    const sellId = randomUUID();
+    const requestId = String(newSell.requestId || sellId);
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(requestId)) throw new Error("معرف طلب البيع غير صالح");
+    const context = {
+      sellId, paymentId: randomUUID(), journalId: randomUUID(),
+      requestKey: `product_sale_${requestId}`,
+      fingerprint: createHash("sha256").update(JSON.stringify(newSell)).digest("hex"),
+      now: new Date().toISOString(),
+    };
+    const rootRef = ref(database);
+    const seed = await get(rootRef);
+    let transactionError: Error | null = null;
+    const result = await runTransaction(rootRef, (current: any) => {
+      try {
+        transactionError = null;
+        return applyProductSaleSettlement(current || seed.val() || {}, newSell, context).state;
+      } catch (error: any) {
+        transactionError = error;
+        return;
+      }
+    }, { applyLocally: false });
+    if (!result.committed) throw transactionError || new Error("تعذر إتمام فاتورة البيع");
+    resetProductsCache?.();
+    const state = result.snapshot.val();
+    const savedId = state.financialRequests?.[context.requestKey]?.sellId || sellId;
+    return state.sells[savedId] as sell;
+  }
   try {
     let productsForSell: sell["products"] = newSell.products.map((product) => ({
       ...product,

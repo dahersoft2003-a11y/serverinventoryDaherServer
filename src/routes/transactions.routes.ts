@@ -14,7 +14,6 @@ router.post("/goodsPayment", createGoodsPayment);
 router.post("/goodsPayment/:id/reverse", cancelGoodsPayment);
 
 router.post("/purchase", async (req: Request, res: Response) => {
-  console.log(req.body)
   try {
     const { newPurchase, newProduct } = req.body;
 
