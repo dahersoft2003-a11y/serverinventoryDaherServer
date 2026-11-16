@@ -1,5 +1,4 @@
 import type { ProductPriceType } from "./product";
-
 export interface sell {
   id?: string;
   requestId?: string;
@@ -11,27 +10,14 @@ export interface sell {
   receivableAccountId?: string;
   salesAccountId?: string;
   currency: string;
-  exchangeRate: number;
-  amount_base: number;
-  priceCurrency?: "USD";
-  paymentCurrency?: "USD" | "SYP";
-  subtotalUSD?: number;
-  totalUSD?: number;
-  totalSYP?: number;
-  totalOriginal?: number;
-  paidUSD?: number;
-  paidSYP?: number;
-  paidOriginal?: number;
-  remainingUSD?: number;
-  remainingSYP?: number;
-  remainingOriginal?: number;
+  amount: number;
+  subtotal?: number;
+  paidAmount?: number;
   discountType?: "none" | "amount" | "percent" | "mixed";
   discountPercent?: number;
-  discountPercentUSD?: number;
-  discountAmountUSD?: number;
-  discountUSD?: number;
-  discountSYP?: number;
-  discountOriginal?: number;
+  discountPercentAmount?: number;
+  discountAmount?: number;
+  discount?: number;
   products: {
     category: string;
     code: string;
@@ -50,7 +36,6 @@ export interface sell {
   }[];
   date?: string;
   partValue?: number;
-  discount?: number;
   vehicleId?: string;
   vehicleName?: string;
   driverId?: string;
@@ -58,7 +43,7 @@ export interface sell {
   sourceWarehouse?: string;
   updatedAt?: string;
   originalProducts?: sell["products"];
-  originalTotalUSD?: number;
-  originalSubtotalUSD?: number;
-  originalDiscountUSD?: number;
+  originalTotal?: number;
+  originalSubtotal?: number;
+  originalDiscount?: number;
 }

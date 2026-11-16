@@ -1,5 +1,4 @@
 export type MaterialReservationStatus = "reserved" | "closed" | "cancelled";
-
 export interface MaterialReservationItem {
   id: string;
   productId: string;
@@ -17,7 +16,6 @@ export interface MaterialReservationItem {
   returnedQty?: number;
   lineTotal?: number;
 }
-
 export interface MaterialReservation {
   id: string;
   customerId: string;
@@ -33,8 +31,8 @@ export interface MaterialReservation {
   totalPrice?: number;
   discount?: number;
   discountPercent?: number;
-  discountPercentUSD?: number;
-  discountAmountUSD?: number;
+  discountPercentAmount?: number;
+  discountAmount?: number;
   createdAt: string;
   updatedAt: string;
   closedAt?: string;

@@ -4,21 +4,15 @@ import { database } from "../firebaseConfig";
 import { handleSell } from "../functions/transactions";
 import { InvoiceDraft, InvoiceDraftProduct } from "../types/invoiceDraft";
 import { sell } from "../types/sell";
-import {
-  requireCurrentUser,
-  sanitizeFirebaseKey,
-} from "../utils/currentUser";
-
+import { requireCurrentUser, sanitizeFirebaseKey } from "../utils/currentUser";
 const toNumber = (value: unknown, fallback = 0) => {
   const next = Number(value);
   return Number.isFinite(next) ? next : fallback;
 };
-
 const normalizePriceType = (
   value: unknown,
 ): InvoiceDraftProduct["selectedPriceType"] => {
   const next = String(value || "custom");
-
   return [
     "payPrice",
     "wholesalePrice",
@@ -29,61 +23,47 @@ const normalizePriceType = (
     ? (next as NonNullable<InvoiceDraftProduct["selectedPriceType"]>)
     : "custom";
 };
-
 const nowIso = () => new Date().toISOString();
-
 const toTimestamp = (value: unknown) => {
   const timestamp = new Date(String(value || "")).getTime();
   return Number.isFinite(timestamp) ? timestamp : 0;
 };
-
 const isStaleWriteAfterClear = (
   currentDraft: Partial<InvoiceDraft>,
   draftPatch: Partial<InvoiceDraft>,
 ) => {
   const clearedAt = toTimestamp(currentDraft?.clearedAt);
-
   if (!clearedAt) {
     return false;
   }
-
   const patchUpdatedAt = toTimestamp(draftPatch?.updatedAt);
-
   if (patchUpdatedAt) {
     return patchUpdatedAt <= clearedAt;
   }
-
   const patchVersion = Number(draftPatch?.version);
   const currentVersion = Number(currentDraft?.version || 0);
-
   if (Number.isFinite(patchVersion)) {
     return patchVersion < currentVersion;
   }
-
   return true;
 };
-
 const stripUndefined = <T>(value: T): T => {
   if (Array.isArray(value)) {
     return value.map(stripUndefined) as T;
   }
-
   if (value && typeof value === "object") {
     return Object.entries(value as Record<string, unknown>).reduce(
       (cleaned, [key, entryValue]) => {
         if (entryValue !== undefined) {
           cleaned[key] = stripUndefined(entryValue);
         }
-
         return cleaned;
       },
       {} as Record<string, unknown>,
     ) as T;
   }
-
   return value;
 };
-
 export const createEmptyInvoiceDraft = (userId: string): InvoiceDraft => ({
   id: sanitizeFirebaseKey(userId),
   userId,
@@ -91,18 +71,15 @@ export const createEmptyInvoiceDraft = (userId: string): InvoiceDraft => ({
   products: [],
   discount: "",
   discountPercent: "",
-  discountAmount: "",
   paymentStatus: "cash",
   partValue: "",
-  currency: "",
-  exchangeRate: 1,
+  currency: "SYP",
   paymentAccountId: "",
   receivableAccountId: "",
   salesAccountId: "",
   version: 0,
   updatedAt: nowIso(),
 });
-
 const normalizeProduct = (product: Partial<InvoiceDraftProduct> | any) => ({
   id: String(product?.id || product?.productId || ""),
   productId: product?.productId ? String(product.productId) : undefined,
@@ -118,16 +95,13 @@ const normalizeProduct = (product: Partial<InvoiceDraftProduct> | any) => ({
   quantity: toNumber(product?.quantity),
   reservedQuantity: toNumber(product?.reservedQuantity),
   alertQuantity:
-    product?.alertQuantity === undefined
-      ? undefined
-      : toNumber(product.alertQuantity),
+    product?.alertQuantity === undefined ? undefined : toNumber(product.alertQuantity),
   warehouse: String(product?.warehouse || ""),
   updatedDate: String(product?.updatedDate || ""),
   qty: toNumber(product?.qty, 1),
   totalPrice:
     product?.totalPrice === undefined ? undefined : toNumber(product.totalPrice),
 });
-
 const normalizeDraft = (
   userId: string,
   rawDraft?: Partial<InvoiceDraft> | null,
@@ -136,7 +110,6 @@ const normalizeDraft = (
 ): InvoiceDraft => {
   const emptyDraft = createEmptyInvoiceDraft(userId);
   const paymentStatus = String(rawDraft?.paymentStatus || emptyDraft.paymentStatus);
-
   return stripUndefined({
     ...emptyDraft,
     ...rawDraft,
@@ -154,10 +127,6 @@ const normalizeDraft = (
       rawDraft?.discountPercent === undefined || rawDraft?.discountPercent === null
         ? ""
         : String(rawDraft.discountPercent),
-    discountAmount:
-      rawDraft?.discountAmount === undefined || rawDraft?.discountAmount === null
-        ? ""
-        : String(rawDraft.discountAmount),
     paymentStatus: ["cash", "part", "debt"].includes(paymentStatus)
       ? (paymentStatus as InvoiceDraft["paymentStatus"])
       : "cash",
@@ -165,8 +134,7 @@ const normalizeDraft = (
       rawDraft?.partValue === undefined || rawDraft?.partValue === null
         ? ""
         : String(rawDraft.partValue),
-    currency: String(rawDraft?.currency || ""),
-    exchangeRate: toNumber(rawDraft?.exchangeRate, 1),
+    currency: "SYP",
     paymentAccountId: String(rawDraft?.paymentAccountId || ""),
     receivableAccountId: String(rawDraft?.receivableAccountId || ""),
     salesAccountId: String(rawDraft?.salesAccountId || ""),
@@ -175,17 +143,13 @@ const normalizeDraft = (
     clearedAt: rawDraft?.clearedAt ? String(rawDraft.clearedAt) : undefined,
   });
 };
-
 const getDraftRef = (userId: string) =>
   ref(database, `invoiceDrafts/${sanitizeFirebaseKey(userId)}`);
-
 export const getInvoiceDraftInternal = async (userId: string) => {
   const snapshot = await get(getDraftRef(userId));
-
   if (!snapshot.exists()) {
     return createEmptyInvoiceDraft(userId);
   }
-
   return normalizeDraft(
     userId,
     snapshot.val(),
@@ -193,7 +157,6 @@ export const getInvoiceDraftInternal = async (userId: string) => {
     false,
   );
 };
-
 export const saveInvoiceDraftInternal = async (
   userId: string,
   draftPatch: Partial<InvoiceDraft>,
@@ -204,37 +167,22 @@ export const saveInvoiceDraftInternal = async (
     ? snapshot.val()
     : createEmptyInvoiceDraft(userId);
   const currentVersion = Number(currentDraft?.version || 0);
-
   if (isStaleWriteAfterClear(currentDraft, draftPatch)) {
     return normalizeDraft(userId, currentDraft, currentVersion, false);
   }
-
   const mergedDraft: Partial<InvoiceDraft> = {
     ...currentDraft,
     ...draftPatch,
     updatedBy,
   };
-
   delete mergedDraft.clearedAt;
-
-  const nextDraft = normalizeDraft(
-    userId,
-    mergedDraft,
-    currentVersion,
-  );
-
+  const nextDraft = normalizeDraft(userId, mergedDraft, currentVersion);
   await set(getDraftRef(userId), nextDraft);
   return nextDraft;
 };
-
-export const clearInvoiceDraftInternal = async (
-  userId: string,
-  updatedBy?: string,
-) => {
+export const clearInvoiceDraftInternal = async (userId: string, updatedBy?: string) => {
   const snapshot = await get(getDraftRef(userId));
-  const currentVersion = snapshot.exists()
-    ? Number(snapshot.val()?.version || 0)
-    : 0;
+  const currentVersion = snapshot.exists() ? Number(snapshot.val()?.version || 0) : 0;
   const clearedAt = nowIso();
   const clearedDraft = normalizeDraft(
     userId,
@@ -246,11 +194,9 @@ export const clearInvoiceDraftInternal = async (
     },
     currentVersion,
   );
-
   await set(getDraftRef(userId), clearedDraft);
   return clearedDraft;
 };
-
 export const getMyInvoiceDraft = async (req: Request, res: Response) => {
   try {
     const user = requireCurrentUser(req);
@@ -261,7 +207,6 @@ export const getMyInvoiceDraft = async (req: Request, res: Response) => {
     res.status(status).json({ message: "تعذر تحميل مسودة الفاتورة" });
   }
 };
-
 export const updateMyInvoiceDraft = async (req: Request, res: Response) => {
   try {
     const user = requireCurrentUser(req);
@@ -271,14 +216,12 @@ export const updateMyInvoiceDraft = async (req: Request, res: Response) => {
       draftPatch,
       user.username,
     );
-
     res.json({ draft });
   } catch (error: any) {
     const status = error.message === "USER_REQUIRED" ? 401 : 500;
     res.status(status).json({ message: "تعذر حفظ مسودة الفاتورة" });
   }
 };
-
 export const clearMyInvoiceDraft = async (req: Request, res: Response) => {
   try {
     const user = requireCurrentUser(req);
@@ -289,24 +232,18 @@ export const clearMyInvoiceDraft = async (req: Request, res: Response) => {
     res.status(status).json({ message: "تعذر تفريغ مسودة الفاتورة" });
   }
 };
-
 export const checkoutMyInvoiceDraft = async (req: Request, res: Response) => {
   try {
     const user = requireCurrentUser(req);
     const newSell = req.body?.newSell as sell | undefined;
-
     if (!newSell) {
       return res.status(400).json({ message: "بيانات الفاتورة غير مكتملة" });
     }
-
     const result = await handleSell({ newSell });
-
     if (!result) {
       throw new Error("تعذر إنشاء فاتورة البيع");
     }
-
     const draft = await clearInvoiceDraftInternal(user.userId, user.username);
-
     res.json({
       message: "تم إنشاء الفاتورة وتفريغ المسودة بنجاح",
       data: result,

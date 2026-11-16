@@ -8,7 +8,7 @@ import paymentsRouter from "./payments.routes";
 import customersRouter from "./customer.routes";
 import sellsRouter from "./sells.routes";
 import warehousesRouter from "./warehouse.routes";
-import account from "./account"
+import account from "./account";
 import journalEntriesRouter from "./journalEntries.routes";
 import aiRoutes from "./ai";
 import returnsRouter from "./returns.routes";
@@ -21,13 +21,11 @@ import quotationsRouter from "./quotations.routes";
 import vehiclesRouter from "./vehicles.routes";
 import currencyMigrationRouter from "./currencyMigration.routes";
 import driverStatementsRouter from "./driverStatements.routes";
-
-
+import { requireSypSchema } from "../middleware/currencySchema";
 const router = Router();
-
 router.use("/auth", authRoutes);
+router.use(requireSypSchema);
 router.use("/users", usersRouter);
-
 router.use("/products", productsRouter);
 router.use("/suppliers", suppliersRouter);
 router.use("/purchases", purchasesRouter);
@@ -36,7 +34,7 @@ router.use("/payments", paymentsRouter);
 router.use("/customers", customersRouter);
 router.use("/sells", sellsRouter);
 router.use("/warehouses", warehousesRouter);
-router.use('/account' , account)
+router.use("/account", account);
 router.use("/returns", returnsRouter);
 router.use("/journal-entries", journalEntriesRouter);
 router.use("/ai", aiRoutes);
@@ -48,6 +46,4 @@ router.use("/quotations", quotationsRouter);
 router.use("/vehicles", vehiclesRouter);
 router.use("/currency-migration", currencyMigrationRouter);
 router.use("/driver-statements", driverStatementsRouter);
-
-
 export default router;

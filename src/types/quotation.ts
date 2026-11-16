@@ -1,12 +1,5 @@
 import type { ProductPriceType } from "./product";
-
-export type QuotationStatus =
-  | "draft"
-  | "sent"
-  | "accepted"
-  | "rejected"
-  | "converted";
-
+export type QuotationStatus = "draft" | "sent" | "accepted" | "rejected" | "converted";
 export interface QuotationProduct {
   id: string;
   productId?: string;
@@ -26,7 +19,6 @@ export interface QuotationProduct {
   updatedDate?: string;
   alertQuantity?: number;
 }
-
 export interface Quotation {
   id?: string;
   number: string;
@@ -38,11 +30,10 @@ export interface Quotation {
   discount: number;
   discountType?: "none" | "amount" | "percent" | "mixed";
   discountPercent?: number;
-  discountPercentUSD?: number;
-  discountAmountUSD?: number;
+  discountPercentAmount?: number;
+  discountAmount?: number;
   totalPrice: number;
   currency: string;
-  exchangeRate: number;
   status: QuotationStatus;
   validUntil?: string;
   note?: string;

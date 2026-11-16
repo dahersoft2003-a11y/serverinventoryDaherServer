@@ -4,14 +4,10 @@ export interface JournalEntryLine {
   accountName?: string;
   debit: number;
   credit: number;
-  currency?: "USD" | "SYP";
-  exchangeRate?: number;
-  amountUSD?: number;
-  amountSYP?: number;
-  amountOriginal?: number;
+  currency?: "SYP";
+  amount?: number;
   note?: string;
 }
-
 export interface JournalEntry {
   id: string;
   date: string;

@@ -13,7 +13,6 @@ import {
   updateQuantityOnSell,
 } from "../controllers/products.controller";
 import {
-  createPurchaseInternal,
   getPurchaseByIdInternal,
   updatePurchaseInternal,
 } from "../controllers/purchases.controller";
@@ -23,15 +22,12 @@ import {
   createSellInternal,
   returnProductsFromSellInternal,
 } from "../controllers/sells.controller";
-import {
-  updateSupplierBalanceInternal,
-  updateSupplierInternal,
-} from "../controllers/suppliers.controller";
+import { updateSupplierBalanceInternal } from "../controllers/suppliers.controller";
 import { createTransferInternal } from "../controllers/transfer.controller";
 import { updateAccountBalanceInternal } from "../controllers/account.controller";
 import { createJournalEntryInternal } from "../controllers/journalEntries.controller";
 import { Payment } from "../types/payment";
-import { prepareDriverRefundPayments, prepareDriverPayment } from "../utils/driverCommission";
+import { prepareDriverRefundPayments } from "../utils/driverCommission";
 import { applyCashPartySettlement } from "../utils/cashPartySettlement";
 import { normalizeCashPaymentMoney } from "../utils/cashPaymentInput";
 import { createHash, randomUUID } from "crypto";
@@ -42,14 +38,9 @@ import { database } from "../firebaseConfig";
 import { get, ref, update, runTransaction } from "firebase/database";
 import {
   buildInvoiceMoneyBreakdown,
-  buildPaymentMoneyBreakdown,
   normalizeCurrency,
-  normalizeExchangeRate,
-  originalToUSD,
   roundMoney,
   toMoneyNumber,
-  usdToOriginal,
-  usdToSYPForPaymentCurrency,
 } from "../utils/money";
 import {
   calculateSaleReturn,
@@ -58,225 +49,129 @@ import {
 } from "../utils/saleReturn";
 import { applyProductPurchaseSettlement } from "../utils/productPurchaseSettlement";
 import { applyProductSaleSettlement } from "../utils/productSaleSettlement";
-
 type SellStockUpdater = (product: sell["products"][number]) => Promise<void>;
-
 type LedgerEntry = {
   accountId?: string;
   entryType: "debit" | "credit";
   amount?: number;
-  currency?: "USD" | "SYP";
-  exchangeRate?: number;
-  amountOriginal?: number;
-  amountSYP?: number;
+  currency?: "SYP";
 };
-
 const standardPriceTypes: ProductPriceType[] = [
   "payPrice",
   "wholesalePrice",
   "superWholesalePrice",
   "sellPrice",
 ];
-
 const normalizeSelectedPriceType = (value: unknown): ProductPriceType => {
   const next = String(value || "custom");
-
   return [...standardPriceTypes, "custom"].includes(next as ProductPriceType)
     ? (next as ProductPriceType)
     : "custom";
 };
-
 const toFiniteNumber = (value: unknown, fallback = 0) => {
   const next = Number(value);
   return Number.isFinite(next) ? next : fallback;
 };
-
 const hasSubmittedValue = (value: unknown) => {
   return value !== undefined && value !== null && String(value).trim() !== "";
 };
-
 const stripUndefinedFields = <T extends Record<string, any>>(value: T): T =>
   Object.fromEntries(
     Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
   ) as T;
-
 const getSubmittedDiscountAmount = (invoice: {
   discount?: unknown;
-  discountAmountUSD?: unknown;
   discountAmount?: unknown;
   discountPercent?: unknown;
 }) => {
-  if (hasSubmittedValue(invoice.discountAmountUSD)) {
-    return toFiniteNumber(invoice.discountAmountUSD);
-  }
-
   if (hasSubmittedValue(invoice.discountAmount)) {
     return toFiniteNumber(invoice.discountAmount);
   }
-
+  if (hasSubmittedValue(invoice.discount)) {
+    return toFiniteNumber(invoice.discount);
+  }
   if (hasSubmittedValue(invoice.discountPercent)) {
     return 0;
   }
-
   return toFiniteNumber(invoice.discount);
 };
-
-const getSubmittedDiscountPercent = (invoice: {
-  discountPercent?: unknown;
-}) => toFiniteNumber(invoice.discountPercent);
-
+const getSubmittedDiscountPercent = (invoice: { discountPercent?: unknown }) =>
+  toFiniteNumber(invoice.discountPercent);
 const assertInvoiceDiscountIsValid = ({
-  subtotalUSD,
+  subtotal: subtotalAmount,
   discountPercent,
-  discountAmountUSD,
+  discountAmount: fixedDiscountAmount,
 }: {
-  subtotalUSD: number;
+  subtotal: number;
   discountPercent: number;
-  discountAmountUSD: number;
+  discountAmount: number;
 }) => {
   if (discountPercent < 0 || discountPercent > 100) {
     throw new Error("Discount percent must be between 0 and 100");
   }
-
-  if (discountAmountUSD < 0) {
+  if (fixedDiscountAmount < 0) {
     throw new Error("Discount amount cannot be negative");
   }
-
-  if (subtotalUSD <= 0) {
-    if (discountPercent > 0 || discountAmountUSD > 0) {
+  if (subtotalAmount <= 0) {
+    if (discountPercent > 0 || fixedDiscountAmount > 0) {
       throw new Error("Discount must be less than invoice subtotal");
     }
-
     return;
   }
-
-  const percentDiscountUSD = roundMoney(subtotalUSD * (discountPercent / 100));
-  const discountUSD = roundMoney(percentDiscountUSD + discountAmountUSD);
-
-  if (discountUSD >= subtotalUSD) {
+  const percentDiscountAmount = roundMoney(subtotalAmount * (discountPercent / 100));
+  const discountAmount = roundMoney(percentDiscountAmount + fixedDiscountAmount);
+  if (discountAmount >= subtotalAmount) {
     throw new Error("Discount must be less than invoice subtotal");
   }
 };
-
-const normalizePaymentStatus = (
-  value: unknown,
-): "cash" | "part" | "debt" => {
-  return value === "cash" || value === "part" || value === "debt"
-    ? value
-    : "debt";
+const normalizePaymentStatus = (value: unknown): "cash" | "part" | "debt" => {
+  return value === "cash" || value === "part" || value === "debt" ? value : "debt";
 };
-
 const buildMoneyFromSubmittedInvoice = ({
-  totalUSD,
-  subtotalUSD,
+  totalPrice: totalAmount,
+  subtotal: subtotalAmount,
   paymentStatus,
   currency,
-  exchangeRate,
   partValue,
   remainingDebt,
-  discountUSD,
-  discountAmountUSD,
+  discount: discountAmount,
+  discountAmount: fixedDiscountAmount,
   discountPercent,
 }: {
-  totalUSD: number;
-  subtotalUSD?: number;
+  totalPrice: number;
+  subtotal?: number;
   paymentStatus: unknown;
   currency: unknown;
-  exchangeRate: unknown;
   partValue?: unknown;
   remainingDebt?: unknown;
-  discountUSD?: number;
-  discountAmountUSD?: number;
+  discount?: number;
+  discountAmount?: number;
   discountPercent?: number;
 }) => {
   const status = normalizePaymentStatus(paymentStatus);
   const paymentCurrency = normalizeCurrency(currency);
-  const normalizedExchangeRate = normalizeExchangeRate(
-    paymentCurrency,
-    exchangeRate,
-  );
-  const safeTotalUSD = roundMoney(Math.max(toMoneyNumber(totalUSD), 0));
-  const submittedRemainingUSD = toMoneyNumber(remainingDebt, NaN);
-  const paidUSD =
+  const safeTotalAmount = roundMoney(Math.max(toMoneyNumber(totalAmount), 0));
+  const submittedRemainingAmount = toMoneyNumber(remainingDebt, NaN);
+  const paidAmount =
     status === "cash"
-      ? safeTotalUSD
-      : status === "part" && Number.isFinite(submittedRemainingUSD)
-        ? Math.max(safeTotalUSD - submittedRemainingUSD, 0)
+      ? safeTotalAmount
+      : status === "part" && Number.isFinite(submittedRemainingAmount)
+        ? Math.max(safeTotalAmount - submittedRemainingAmount, 0)
         : status === "part"
-          ? originalToUSD(
-              toMoneyNumber(partValue),
-              paymentCurrency,
-              normalizedExchangeRate,
-            )
+          ? roundMoney(toMoneyNumber(partValue))
           : 0;
-  const partOriginal = usdToOriginal(
-    Math.min(Math.max(paidUSD, 0), safeTotalUSD),
-    paymentCurrency,
-    normalizedExchangeRate,
-  );
-
+  const partOriginal = roundMoney(Math.min(Math.max(paidAmount, 0), safeTotalAmount));
   return buildInvoiceMoneyBreakdown({
-    totalUSD: safeTotalUSD,
-    subtotalUSD,
+    totalPrice: safeTotalAmount,
+    subtotal: subtotalAmount,
     paymentStatus: status,
     currency: paymentCurrency,
-    exchangeRate: normalizedExchangeRate,
     partValue: partOriginal,
-    discountUSD,
-    discountAmountUSD,
+    discount: discountAmount,
+    discountAmount: fixedDiscountAmount,
     discountPercent,
   });
 };
-
-const normalizePaymentForStorage = (paymentData: Payment): Payment => {
-  const paymentCurrency = normalizeCurrency(
-    paymentData.paymentCurrency || paymentData.currency,
-  );
-  const money = buildPaymentMoneyBreakdown({
-    amount: paymentData.amount,
-    amountUSD: paymentData.amountUSD,
-    currency: paymentCurrency,
-    exchangeRate: paymentData.exchangeRate,
-    amountOriginal: paymentData.amountOriginal ?? paymentData.amount_base,
-  });
-
-  return {
-    ...paymentData,
-    currency: paymentCurrency,
-    paymentCurrency,
-    exchangeRate: money.exchangeRate,
-    amount: money.amountUSD,
-    amount_base: money.amountBase,
-    amountUSD: money.amountUSD,
-    amountSYP: money.amountSYP,
-    amountOriginal: money.amountOriginal,
-    balanceSYPChange: paymentData.balanceSYPChange ?? money.amountSYP,
-  };
-};
-
-const getLegacyInvoiceOriginalAmount = (invoiceData: {
-  totalOriginal?: number;
-  totalUSD?: number;
-  totalPrice?: number;
-  currency?: string;
-  paymentCurrency?: "USD" | "SYP";
-  exchangeRate?: number;
-}) => {
-  if (invoiceData.totalOriginal !== undefined) {
-    return toFiniteNumber(invoiceData.totalOriginal);
-  }
-
-  const currency = normalizeCurrency(
-    invoiceData.paymentCurrency || invoiceData.currency,
-  );
-  const exchangeRate = normalizeExchangeRate(currency, invoiceData.exchangeRate);
-  return usdToOriginal(
-    toFiniteNumber(invoiceData.totalUSD, toFiniteNumber(invoiceData.totalPrice)),
-    currency,
-    exchangeRate,
-  );
-};
-
 const resolveProductPrice = (
   stockProduct: Product,
   selectedPriceType: ProductPriceType,
@@ -285,40 +180,36 @@ const resolveProductPrice = (
   if (selectedPriceType === "custom") {
     return submittedPrice;
   }
-
   const stockPrice = toFiniteNumber(stockProduct[selectedPriceType]);
-
   return stockPrice > 0
     ? stockPrice
     : submittedPrice > 0
       ? submittedPrice
       : toFiniteNumber(stockProduct.sellPrice);
 };
-
 const normalizeSellProductFromStock = (
   rawProduct: sell["products"][number],
   stockProduct: Product,
 ): sell["products"][number] => {
-  const selectedPriceType = normalizeSelectedPriceType(
-    rawProduct.selectedPriceType,
-  );
+  const selectedPriceType = normalizeSelectedPriceType(rawProduct.selectedPriceType);
   const sellPrice = resolveProductPrice(
     stockProduct,
     selectedPriceType,
     toFiniteNumber(rawProduct.sellPrice),
   );
-
   if (sellPrice <= 0) {
     throw new Error(`Invalid sell price for ${stockProduct.code}`);
   }
-
   return {
     ...rawProduct,
     category: stockProduct.category || rawProduct.category || "",
     code: stockProduct.code || rawProduct.code,
     id: stockProduct.id || rawProduct.id,
     name: stockProduct.name || rawProduct.name,
-    payPrice: toFiniteNumber(stockProduct.payPrice, toFiniteNumber(rawProduct.payPrice)),
+    payPrice: toFiniteNumber(
+      stockProduct.payPrice,
+      toFiniteNumber(rawProduct.payPrice),
+    ),
     wholesalePrice:
       stockProduct.wholesalePrice === undefined
         ? rawProduct.wholesalePrice
@@ -327,7 +218,10 @@ const normalizeSellProductFromStock = (
       stockProduct.superWholesalePrice === undefined
         ? rawProduct.superWholesalePrice
         : toFiniteNumber(stockProduct.superWholesalePrice),
-    quantity: toFiniteNumber(stockProduct.quantity, toFiniteNumber(rawProduct.quantity)),
+    quantity: toFiniteNumber(
+      stockProduct.quantity,
+      toFiniteNumber(rawProduct.quantity),
+    ),
     sellPrice,
     selectedPriceType,
     unit: stockProduct.unit || rawProduct.unit || "",
@@ -336,27 +230,20 @@ const normalizeSellProductFromStock = (
     qty: toFiniteNumber(rawProduct.qty),
   };
 };
-
 const postLedgerEntries = async (entries: LedgerEntry[]) => {
   for (const entry of entries) {
     const amount = Number(entry.amount || 0);
-
     if (!entry.accountId || amount <= 0) {
       continue;
     }
-
     await updateAccountBalanceInternal({
       accountId: entry.accountId,
       entryType: entry.entryType,
       amount,
       currency: entry.currency,
-      exchangeRate: entry.exchangeRate,
-      amountOriginal: entry.amountOriginal,
-      amountSYP: entry.amountSYP,
     });
   }
 };
-
 const assertAccountCanTransact = async (
   accountId: string | undefined,
   label: string,
@@ -364,18 +251,15 @@ const assertAccountCanTransact = async (
   if (!accountId) {
     throw new Error(`${label} account is required`);
   }
-
   const accountSnapshot = await get(ref(database, `accounts/${accountId}`));
   if (!accountSnapshot.exists()) {
     throw new Error(`${label} account was not found`);
   }
-
   const account = accountSnapshot.val();
   if (account?.allowTransactions === false) {
     throw new Error(`${label} account does not allow transactions`);
   }
 };
-
 const toJournalLines = (entries: LedgerEntry[], note: string) => {
   return entries
     .filter((entry) => entry.accountId && Number(entry.amount || 0) > 0)
@@ -383,258 +267,11 @@ const toJournalLines = (entries: LedgerEntry[], note: string) => {
       accountId: entry.accountId as string,
       debit: entry.entryType === "debit" ? Number(entry.amount || 0) : 0,
       credit: entry.entryType === "credit" ? Number(entry.amount || 0) : 0,
-      currency: entry.currency || "USD",
-      exchangeRate: entry.exchangeRate || 1,
-      amountUSD: Number(entry.amount || 0),
-      amountSYP: Number(entry.amountSYP || 0),
-      amountOriginal:
-        entry.amountOriginal === undefined
-          ? Number(entry.amount || 0)
-          : Number(entry.amountOriginal || 0),
+      currency: entry.currency || "SYP",
+      amount: Number(entry.amount || 0),
       note,
     }));
 };
-
-const applyCustomerPaymentToSell = async (paymentData: Payment) => {
-  if (!paymentData.sellId) return null;
-
-  const amount = Math.abs(
-    toFiniteNumber(paymentData.amountUSD, toFiniteNumber(paymentData.amount)),
-  );
-
-  if (amount <= 0) {
-    throw new Error("Invoice payment amount must be greater than zero");
-  }
-
-  const sellRef = ref(database, `sells/${paymentData.sellId}`);
-  const sellSnapshot = await get(sellRef);
-
-  if (!sellSnapshot.exists()) {
-    throw new Error("Sell invoice not found");
-  }
-
-  const sellData: sell = sellSnapshot.val();
-
-  if (paymentData.customerId && sellData.customerId !== paymentData.customerId) {
-    throw new Error("Payment customer does not match invoice customer");
-  }
-
-  const invoiceCurrency = normalizeCurrency(
-    sellData.paymentCurrency || sellData.currency,
-  );
-  const invoiceExchangeRate = normalizeExchangeRate(
-    invoiceCurrency,
-    sellData.exchangeRate,
-  );
-  const currentRemainingDebt = toFiniteNumber(
-    sellData.remainingUSD,
-    toFiniteNumber(sellData.remainingDebt),
-  );
-
-  if (currentRemainingDebt <= 0) {
-    throw new Error("Invoice is already fully paid");
-  }
-
-  if (amount > currentRemainingDebt) {
-    throw new Error(
-      `Payment amount is greater than invoice remaining debt. Remaining: ${currentRemainingDebt}`,
-    );
-  }
-
-  const nextRemainingDebt = roundMoney(currentRemainingDebt - amount);
-  const nextPaidAmount = roundMoney(
-    toFiniteNumber(sellData.totalUSD, toFiniteNumber(sellData.totalPrice)) -
-      nextRemainingDebt,
-  );
-  const nextPaidOriginal = usdToOriginal(
-    nextPaidAmount,
-    invoiceCurrency,
-    invoiceExchangeRate,
-  );
-  const nextPaymentStatus: sell["paymentStatus"] =
-    nextRemainingDebt === 0 ? "cash" : "part";
-  const paymentSYPChange =
-    invoiceCurrency === "SYP"
-      ? usdToOriginal(amount, invoiceCurrency, invoiceExchangeRate)
-      : 0;
-
-  paymentData.balanceSYPChange = paymentSYPChange;
-
-  await update(sellRef, {
-    remainingDebt: nextRemainingDebt,
-    remainingUSD: nextRemainingDebt,
-    remainingSYP: usdToSYPForPaymentCurrency(
-      nextRemainingDebt,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    remainingOriginal: usdToOriginal(
-      nextRemainingDebt,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    paidUSD: nextPaidAmount,
-    paidSYP: usdToSYPForPaymentCurrency(
-      nextPaidAmount,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    paidOriginal: nextPaidOriginal,
-    paymentStatus: nextPaymentStatus,
-    partValue: nextPaidOriginal,
-    updatedAt: new Date().toISOString(),
-  });
-
-  return {
-    ...sellData,
-    remainingDebt: nextRemainingDebt,
-    remainingUSD: nextRemainingDebt,
-    remainingSYP: usdToSYPForPaymentCurrency(
-      nextRemainingDebt,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    remainingOriginal: usdToOriginal(
-      nextRemainingDebt,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    paidUSD: nextPaidAmount,
-    paidSYP: usdToSYPForPaymentCurrency(
-      nextPaidAmount,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    paidOriginal: nextPaidOriginal,
-    paymentStatus: nextPaymentStatus,
-    partValue: nextPaidOriginal,
-  };
-};
-
-const applySupplierPaymentToPurchase = async (paymentData: Payment) => {
-  if (!paymentData.purchaseId) return null;
-
-  const rawAmount = toFiniteNumber(
-    paymentData.amountUSD,
-    toFiniteNumber(paymentData.amount),
-  );
-  const amount = Math.abs(rawAmount);
-
-  if (rawAmount >= 0 || amount <= 0) {
-    throw new Error("Supplier invoice payment amount must reduce supplier debt");
-  }
-
-  const purchaseRef = ref(database, `purchases/${paymentData.purchaseId}`);
-  const purchaseSnapshot = await get(purchaseRef);
-
-  if (!purchaseSnapshot.exists()) {
-    throw new Error("Purchase invoice not found");
-  }
-
-  const purchaseData: purchase = purchaseSnapshot.val();
-
-  if (
-    paymentData.supplierId &&
-    purchaseData.supplierId !== paymentData.supplierId
-  ) {
-    throw new Error("Payment supplier does not match purchase invoice supplier");
-  }
-
-  const invoiceCurrency = normalizeCurrency(
-    purchaseData.paymentCurrency || purchaseData.currency,
-  );
-  const invoiceExchangeRate = normalizeExchangeRate(
-    invoiceCurrency,
-    purchaseData.exchangeRate,
-  );
-  const currentRemainingDebt = toFiniteNumber(
-    purchaseData.remainingUSD,
-    toFiniteNumber(purchaseData.remainingDebt),
-  );
-
-  if (currentRemainingDebt <= 0) {
-    throw new Error("Purchase invoice is already fully paid");
-  }
-
-  if (amount > currentRemainingDebt) {
-    throw new Error(
-      `Payment amount is greater than purchase invoice remaining debt. Remaining: ${currentRemainingDebt}`,
-    );
-  }
-
-  const nextRemainingDebt = roundMoney(currentRemainingDebt - amount);
-  const nextPaidAmount = roundMoney(
-    toFiniteNumber(
-      purchaseData.totalUSD,
-      toFiniteNumber(purchaseData.totalPrice),
-    ) - nextRemainingDebt,
-  );
-  const nextPaidOriginal = usdToOriginal(
-    nextPaidAmount,
-    invoiceCurrency,
-    invoiceExchangeRate,
-  );
-  const nextPaymentStatus = nextRemainingDebt === 0 ? "cash" : "part";
-  const paymentSYPChange =
-    invoiceCurrency === "SYP"
-      ? -usdToOriginal(amount, invoiceCurrency, invoiceExchangeRate)
-      : 0;
-
-  paymentData.balanceSYPChange = paymentSYPChange;
-
-  await update(purchaseRef, {
-    remainingDebt: nextRemainingDebt,
-    remainingUSD: nextRemainingDebt,
-    remainingSYP: usdToSYPForPaymentCurrency(
-      nextRemainingDebt,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    remainingOriginal: usdToOriginal(
-      nextRemainingDebt,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    paidUSD: nextPaidAmount,
-    paidSYP: usdToSYPForPaymentCurrency(
-      nextPaidAmount,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    paidOriginal: nextPaidOriginal,
-    paymentStatus: nextPaymentStatus,
-    paidAmount: nextPaidAmount,
-    partValue: nextPaidOriginal,
-    updatedAt: new Date().toISOString(),
-  });
-
-  return {
-    ...purchaseData,
-    remainingDebt: nextRemainingDebt,
-    remainingUSD: nextRemainingDebt,
-    remainingSYP: usdToSYPForPaymentCurrency(
-      nextRemainingDebt,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    remainingOriginal: usdToOriginal(
-      nextRemainingDebt,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    paidUSD: nextPaidAmount,
-    paidSYP: usdToSYPForPaymentCurrency(
-      nextPaidAmount,
-      invoiceCurrency,
-      invoiceExchangeRate,
-    ),
-    paidOriginal: nextPaidOriginal,
-    paymentStatus: nextPaymentStatus,
-    paidAmount: nextPaidAmount,
-    partValue: nextPaidOriginal,
-  };
-};
-
 export const handlePurchase = async ({
   newPurchase,
   newProduct,
@@ -644,46 +281,62 @@ export const handlePurchase = async ({
 }) => {
   const quantity = Number(newProduct.quantity);
   const price = Number(newProduct.payPrice);
-  if (!newProduct.id || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0) {
+  if (
+    !newProduct.id ||
+    !Number.isFinite(quantity) ||
+    quantity <= 0 ||
+    !Number.isFinite(price) ||
+    price <= 0
+  ) {
     throw new Error("اختر منتجًا موجودًا وكمية وسعر شراء صحيحين");
   }
   const expectedTotal = roundMoney(quantity * price);
-  if (!Number.isFinite(expectedTotal) || expectedTotal <= 0 || roundMoney(Number(newPurchase.totalPrice)) !== expectedTotal) {
+  if (
+    !Number.isFinite(expectedTotal) ||
+    expectedTotal <= 0 ||
+    roundMoney(Number(newPurchase.totalPrice)) !== expectedTotal
+  ) {
     throw new Error("إجمالي الفاتورة لا يطابق الكمية وسعر الشراء");
   }
-  if (!["cash", "part", "debt"].includes(newPurchase.paymentStatus) || !["USD", "SYP"].includes(newPurchase.currency)) {
+  if (
+    !["cash", "part", "debt"].includes(newPurchase.paymentStatus) ||
+    !["SYP"].includes(newPurchase.currency)
+  ) {
     throw new Error("حالة الدفع أو العملة غير صالحة");
   }
   const purchaseStatus = normalizePaymentStatus(newPurchase.paymentStatus);
   const purchaseMoney = buildMoneyFromSubmittedInvoice({
-    totalUSD: expectedTotal,
+    totalPrice: expectedTotal,
     paymentStatus: purchaseStatus,
     currency: newPurchase.currency,
-    exchangeRate: newPurchase.exchangeRate,
-    partValue: newPurchase.partValue ?? newPurchase.amount_base,
+    partValue: newPurchase.partValue ?? newPurchase.amount,
     remainingDebt: newPurchase.remainingDebt,
   });
-
   if (
     purchaseStatus === "part" &&
-    (purchaseMoney.paidUSD <= 0 || purchaseMoney.paidUSD >= purchaseMoney.totalUSD)
+    (purchaseMoney.paidAmount <= 0 ||
+      purchaseMoney.paidAmount >= purchaseMoney.totalPrice)
   ) {
     throw new Error(
       "Partial purchase payment must be greater than zero and less than invoice total",
     );
   }
-  const paidOriginal = purchaseStatus === "part"
-    ? roundMoney(Number(newPurchase.partValue))
-    : purchaseMoney.paidOriginal;
-  const remainingOriginal = roundMoney(purchaseMoney.totalOriginal - paidOriginal);
-  if (!Number.isFinite(paidOriginal) || paidOriginal < 0 || remainingOriginal < 0 ||
-      purchaseStatus === "part" && (paidOriginal <= 0 || remainingOriginal <= 0) ||
-      purchaseStatus === "cash" && paidOriginal !== purchaseMoney.totalOriginal ||
-      purchaseStatus === "debt" && paidOriginal !== 0 ||
-      roundMoney(originalToUSD(paidOriginal, purchaseMoney.paymentCurrency, purchaseMoney.exchangeRate)) !== purchaseMoney.paidUSD) {
+  const paidOriginal =
+    purchaseStatus === "part"
+      ? roundMoney(Number(newPurchase.partValue))
+      : purchaseMoney.paidAmount;
+  const remainingOriginal = roundMoney(purchaseMoney.totalPrice - paidOriginal);
+  if (
+    !Number.isFinite(paidOriginal) ||
+    paidOriginal < 0 ||
+    remainingOriginal < 0 ||
+    (purchaseStatus === "part" && (paidOriginal <= 0 || remainingOriginal <= 0)) ||
+    (purchaseStatus === "cash" && paidOriginal !== purchaseMoney.totalPrice) ||
+    (purchaseStatus === "debt" && paidOriginal !== 0) ||
+    roundMoney(roundMoney(paidOriginal)) !== purchaseMoney.paidAmount
+  ) {
     throw new Error("مبلغ الدفع لا يطابق حالة فاتورة الشراء");
   }
-
   const purchaseId = randomUUID();
   const context = {
     purchaseId,
@@ -691,7 +344,9 @@ export const handlePurchase = async ({
     paymentId: randomUUID(),
     journalId: randomUUID(),
     requestKey: `product_purchase_${newPurchase.requestId || purchaseId}`,
-    fingerprint: createHash("sha256").update(JSON.stringify({ newPurchase, newProduct })).digest("hex"),
+    fingerprint: createHash("sha256")
+      .update(JSON.stringify({ newPurchase, newProduct }))
+      .digest("hex"),
     now: new Date().toISOString(),
   };
   if (!/^[A-Za-z0-9_-]{8,128}$/.test(String(newPurchase.requestId || purchaseId))) {
@@ -707,44 +362,41 @@ export const handlePurchase = async ({
     quantity,
     payPrice: price,
     paymentStatus: purchaseStatus,
-    currency: purchaseMoney.paymentCurrency,
-    paymentCurrency: purchaseMoney.paymentCurrency,
-    priceCurrency: purchaseMoney.priceCurrency,
-    exchangeRate: purchaseMoney.exchangeRate,
-    amount_base: purchaseMoney.totalOriginal,
-    totalPrice: purchaseMoney.totalUSD,
-    totalUSD: purchaseMoney.totalUSD,
-    totalSYP: purchaseMoney.totalSYP,
-    totalOriginal: purchaseMoney.totalOriginal,
-    paidUSD: purchaseMoney.paidUSD,
-    paidSYP: purchaseMoney.paymentCurrency === "SYP" ? paidOriginal : 0,
-    paidOriginal,
-    remainingDebt: purchaseMoney.remainingUSD,
-    remainingUSD: purchaseMoney.remainingUSD,
-    remainingSYP: purchaseMoney.paymentCurrency === "SYP" ? remainingOriginal : 0,
-    remainingOriginal,
+    currency: purchaseMoney.currency,
+    amount: purchaseMoney.totalPrice,
+    totalPrice: purchaseMoney.totalPrice,
+    paidAmount: purchaseMoney.paidAmount,
+    remainingDebt: purchaseMoney.remainingDebt,
     partValue: paidOriginal,
   };
-
   const rootRef = ref(database);
   const seed = await get(rootRef);
   let transactionError: Error | null = null;
-  const result = await runTransaction(rootRef, (current: any) => {
-    try {
-      transactionError = null;
-      return applyProductPurchaseSettlement(current || seed.val() || {}, purchaseData, newProduct, context).state;
-    } catch (error: any) {
-      transactionError = error;
-      return;
-    }
-  }, { applyLocally: false });
+  const result = await runTransaction(
+    rootRef,
+    (current: any) => {
+      try {
+        transactionError = null;
+        return applyProductPurchaseSettlement(
+          current || seed.val() || {},
+          purchaseData,
+          newProduct,
+          context,
+        ).state;
+      } catch (error: any) {
+        transactionError = error;
+        return;
+      }
+    },
+    { applyLocally: false },
+  );
   if (!result.committed) throw transactionError || new Error("تعذر إتمام الشراء");
   resetProductsCache?.();
   const state = result.snapshot.val();
-  const savedId = state.financialRequests?.[context.requestKey]?.purchaseId || purchaseId;
+  const savedId =
+    state.financialRequests?.[context.requestKey]?.purchaseId || purchaseId;
   return state.purchases[savedId] as purchase;
 };
-
 export const handleBulkPurchase = async ({
   newPurchase,
 }: {
@@ -763,8 +415,12 @@ export const handleBulkPurchase = async ({
     unit: product.unit,
     quantity: Number(product.quantity),
     payPrice: Number(product.payPrice),
-    wholesalePrice: product.wholesalePrice === undefined ? undefined : Number(product.wholesalePrice),
-    superWholesalePrice: product.superWholesalePrice === undefined ? undefined : Number(product.superWholesalePrice),
+    wholesalePrice:
+      product.wholesalePrice === undefined ? undefined : Number(product.wholesalePrice),
+    superWholesalePrice:
+      product.superWholesalePrice === undefined
+        ? undefined
+        : Number(product.superWholesalePrice),
     sellPrice: product.sellPrice === undefined ? undefined : Number(product.sellPrice),
     alertQuantity: product.alertQuantity,
   }));
@@ -772,8 +428,12 @@ export const handleBulkPurchase = async ({
   for (let index = 0; index < items.length; index++) {
     const item = items[index];
     const lineTotal = item.quantity * Number(item.payPrice);
-    if (!item.id || !Number.isFinite(lineTotal) || lineTotal <= 0 ||
-        productLineTotalMismatch(products[index].lineTotal, lineTotal)) {
+    if (
+      !item.id ||
+      !Number.isFinite(lineTotal) ||
+      lineTotal <= 0 ||
+      productLineTotalMismatch(products[index].lineTotal, lineTotal)
+    ) {
       throw new Error("أحد أسطر فاتورة الشراء غير صالح");
     }
     rawTotal += lineTotal;
@@ -782,25 +442,36 @@ export const handleBulkPurchase = async ({
   if (roundMoney(Number(newPurchase.totalPrice)) !== totalPrice) {
     throw new Error("إجمالي الفاتورة لا يطابق أسعار وكميات المنتجات");
   }
-  if (!["cash", "part", "debt"].includes(newPurchase.paymentStatus) || !["USD", "SYP"].includes(newPurchase.currency)) {
+  if (
+    !["cash", "part", "debt"].includes(newPurchase.paymentStatus) ||
+    !["SYP"].includes(newPurchase.currency)
+  ) {
     throw new Error("حالة الدفع أو العملة غير صالحة");
   }
   const purchaseStatus = normalizePaymentStatus(newPurchase.paymentStatus);
   const money = buildMoneyFromSubmittedInvoice({
-    totalUSD: totalPrice,
+    totalPrice: totalPrice,
     paymentStatus: purchaseStatus,
     currency: newPurchase.currency,
-    exchangeRate: newPurchase.exchangeRate,
-    partValue: newPurchase.partValue ?? newPurchase.amount_base,
+    partValue: newPurchase.partValue ?? newPurchase.amount,
     remainingDebt: newPurchase.remainingDebt,
   });
-  const paidOriginal = purchaseStatus === "part"
-    ? roundMoney(Number(newPurchase.partValue))
-    : money.paidOriginal;
-  const remainingOriginal = roundMoney(money.totalOriginal - paidOriginal);
-  if (!Number.isFinite(paidOriginal) || paidOriginal < 0 || remainingOriginal < 0 ||
-      purchaseStatus === "part" && (money.paidUSD <= 0 || money.remainingUSD <= 0 || paidOriginal <= 0 || remainingOriginal <= 0) ||
-      roundMoney(originalToUSD(paidOriginal, money.paymentCurrency, money.exchangeRate)) !== money.paidUSD) {
+  const paidOriginal =
+    purchaseStatus === "part"
+      ? roundMoney(Number(newPurchase.partValue))
+      : money.paidAmount;
+  const remainingOriginal = roundMoney(money.totalPrice - paidOriginal);
+  if (
+    !Number.isFinite(paidOriginal) ||
+    paidOriginal < 0 ||
+    remainingOriginal < 0 ||
+    (purchaseStatus === "part" &&
+      (money.paidAmount <= 0 ||
+        money.remainingDebt <= 0 ||
+        paidOriginal <= 0 ||
+        remainingOriginal <= 0)) ||
+    roundMoney(roundMoney(paidOriginal)) !== money.paidAmount
+  ) {
     throw new Error("المدفوع والمتبقي لا يطابقان الفاتورة");
   }
   const purchaseId = randomUUID();
@@ -810,7 +481,9 @@ export const handleBulkPurchase = async ({
     paymentId: randomUUID(),
     journalId: randomUUID(),
     requestKey: `product_purchase_${newPurchase.requestId || purchaseId}`,
-    fingerprint: createHash("sha256").update(JSON.stringify({ newPurchase, items })).digest("hex"),
+    fingerprint: createHash("sha256")
+      .update(JSON.stringify({ newPurchase, items }))
+      .digest("hex"),
     now: new Date().toISOString(),
   };
   if (!/^[A-Za-z0-9_-]{8,128}$/.test(String(newPurchase.requestId || purchaseId))) {
@@ -826,22 +499,11 @@ export const handleBulkPurchase = async ({
     quantity: items.reduce((sum, item) => sum + item.quantity, 0),
     payPrice: 0,
     paymentStatus: purchaseStatus,
-    currency: money.paymentCurrency,
-    paymentCurrency: money.paymentCurrency,
-    priceCurrency: money.priceCurrency,
-    exchangeRate: money.exchangeRate,
-    totalPrice: money.totalUSD,
-    amount_base: money.totalOriginal,
-    totalUSD: money.totalUSD,
-    totalSYP: money.totalSYP,
-    totalOriginal: money.totalOriginal,
-    paidUSD: money.paidUSD,
-    paidSYP: money.paymentCurrency === "SYP" ? paidOriginal : 0,
-    paidOriginal,
-    remainingDebt: money.remainingUSD,
-    remainingUSD: money.remainingUSD,
-    remainingSYP: money.paymentCurrency === "SYP" ? remainingOriginal : 0,
-    remainingOriginal,
+    currency: money.currency,
+    totalPrice: money.totalPrice,
+    amount: money.totalPrice,
+    paidAmount: money.paidAmount,
+    remainingDebt: money.remainingDebt,
     partValue: paidOriginal,
     products: items.map((item) => ({
       ...item,
@@ -851,22 +513,32 @@ export const handleBulkPurchase = async ({
   const rootRef = ref(database);
   const seed = await get(rootRef);
   let transactionError: Error | null = null;
-  const result = await runTransaction(rootRef, (current: any) => {
-    try {
-      transactionError = null;
-      return applyProductPurchaseSettlement(current || seed.val() || {}, purchaseData, items, context).state;
-    } catch (error: any) {
-      transactionError = error;
-      return;
-    }
-  }, { applyLocally: false });
-  if (!result.committed) throw transactionError || new Error("تعذر إتمام فاتورة الشراء");
+  const result = await runTransaction(
+    rootRef,
+    (current: any) => {
+      try {
+        transactionError = null;
+        return applyProductPurchaseSettlement(
+          current || seed.val() || {},
+          purchaseData,
+          items,
+          context,
+        ).state;
+      } catch (error: any) {
+        transactionError = error;
+        return;
+      }
+    },
+    { applyLocally: false },
+  );
+  if (!result.committed)
+    throw transactionError || new Error("تعذر إتمام فاتورة الشراء");
   resetProductsCache?.();
   const state = result.snapshot.val();
-  const savedId = state.financialRequests?.[context.requestKey]?.purchaseId || purchaseId;
+  const savedId =
+    state.financialRequests?.[context.requestKey]?.purchaseId || purchaseId;
   return state.purchases[savedId] as purchase;
 };
-
 const productLineTotalMismatch = (submitted: unknown, calculated: number) =>
   submitted !== undefined && roundMoney(Number(submitted)) !== roundMoney(calculated);
 export const handleSell = async ({
@@ -879,9 +551,12 @@ export const handleSell = async ({
   if (!stockUpdater) {
     const sellId = randomUUID();
     const requestId = String(newSell.requestId || sellId);
-    if (!/^[A-Za-z0-9_-]{8,128}$/.test(requestId)) throw new Error("معرف طلب البيع غير صالح");
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(requestId))
+      throw new Error("معرف طلب البيع غير صالح");
     const context = {
-      sellId, paymentId: randomUUID(), journalId: randomUUID(),
+      sellId,
+      paymentId: randomUUID(),
+      journalId: randomUUID(),
       requestKey: `product_sale_${requestId}`,
       fingerprint: createHash("sha256").update(JSON.stringify(newSell)).digest("hex"),
       now: new Date().toISOString(),
@@ -889,16 +564,25 @@ export const handleSell = async ({
     const rootRef = ref(database);
     const seed = await get(rootRef);
     let transactionError: Error | null = null;
-    const result = await runTransaction(rootRef, (current: any) => {
-      try {
-        transactionError = null;
-        return applyProductSaleSettlement(current || seed.val() || {}, newSell, context).state;
-      } catch (error: any) {
-        transactionError = error;
-        return;
-      }
-    }, { applyLocally: false });
-    if (!result.committed) throw transactionError || new Error("تعذر إتمام فاتورة البيع");
+    const result = await runTransaction(
+      rootRef,
+      (current: any) => {
+        try {
+          transactionError = null;
+          return applyProductSaleSettlement(
+            current || seed.val() || {},
+            newSell,
+            context,
+          ).state;
+        } catch (error: any) {
+          transactionError = error;
+          return;
+        }
+      },
+      { applyLocally: false },
+    );
+    if (!result.committed)
+      throw transactionError || new Error("تعذر إتمام فاتورة البيع");
     resetProductsCache?.();
     const state = result.snapshot.val();
     const savedId = state.financialRequests?.[context.requestKey]?.sellId || sellId;
@@ -913,10 +597,8 @@ export const handleSell = async ({
       payPrice: toFiniteNumber(product.payPrice),
       selectedPriceType: normalizeSelectedPriceType(product.selectedPriceType),
     }));
-
     if (!stockUpdater) {
       const normalizedProducts: sell["products"] = [];
-
       for (const product of productsForSell) {
         const stockProduct = await assertProductAvailableForSellInternal(
           product.id,
@@ -924,109 +606,77 @@ export const handleSell = async ({
           product.qty,
           product.code,
         );
-
-        normalizedProducts.push(
-          normalizeSellProductFromStock(product, stockProduct),
-        );
+        normalizedProducts.push(normalizeSellProductFromStock(product, stockProduct));
       }
-
       productsForSell = normalizedProducts;
     }
-
     const subtotal = productsForSell.reduce(
       (sum, product) =>
         sum + toFiniteNumber(product.sellPrice) * toFiniteNumber(product.qty),
       0,
     );
-    const discountAmountUSD = getSubmittedDiscountAmount(newSell);
+    const fixedDiscountAmount = getSubmittedDiscountAmount(newSell);
     const discountPercent = getSubmittedDiscountPercent(newSell);
     assertInvoiceDiscountIsValid({
-      subtotalUSD: subtotal,
+      subtotal: subtotal,
       discountPercent,
-      discountAmountUSD,
+      discountAmount: fixedDiscountAmount,
     });
     const sellStatus = normalizePaymentStatus(newSell.paymentStatus);
     const sellMoney = buildInvoiceMoneyBreakdown({
-      subtotalUSD: subtotal,
+      subtotal: subtotal,
       paymentStatus: sellStatus,
       currency: newSell.currency,
-      exchangeRate: newSell.exchangeRate,
       partValue: newSell.partValue,
-      discountAmountUSD,
+      discountAmount: fixedDiscountAmount,
       discountPercent,
     });
-    const totalPrice = sellMoney.totalUSD;
-    const paidAmount = sellMoney.paidUSD;
-
+    const totalPrice = sellMoney.totalPrice;
+    const paidAmount = sellMoney.paidAmount;
     if (totalPrice <= 0) {
       throw new Error("Sell invoice total must be greater than zero");
     }
-
-    if (
-      sellStatus === "part" &&
-      (paidAmount <= 0 || paidAmount >= totalPrice)
-    ) {
+    if (sellStatus === "part" && (paidAmount <= 0 || paidAmount >= totalPrice)) {
       throw new Error(
         "Partial payment must be greater than zero and less than invoice total",
       );
     }
-
     const accountPreflight: Array<Promise<void>> = [
       assertAccountCanTransact(newSell.salesAccountId, "Sales"),
     ];
-
     if (paidAmount > 0) {
       accountPreflight.push(
         assertAccountCanTransact(newSell.paymentAccountId, "Payment"),
       );
     }
-
-    if (sellMoney.remainingUSD > 0) {
+    if (sellMoney.remainingDebt > 0) {
       accountPreflight.push(
         assertAccountCanTransact(newSell.receivableAccountId, "Receivable"),
       );
     }
-
     await Promise.all(accountPreflight);
-
     const sellToStore: sell = {
       ...newSell,
       products: productsForSell,
       originalProducts: productsForSell.map((product) => ({ ...product })),
-      originalTotalUSD: sellMoney.totalUSD,
-      originalSubtotalUSD: sellMoney.subtotalUSD,
-      originalDiscountUSD: sellMoney.discountUSD,
+      originalTotal: sellMoney.totalPrice,
+      originalSubtotal: sellMoney.subtotal,
+      originalDiscount: sellMoney.discount,
       paymentStatus: sellStatus,
-      currency: sellMoney.paymentCurrency,
-      paymentCurrency: sellMoney.paymentCurrency,
-      priceCurrency: sellMoney.priceCurrency,
-      subtotalUSD: sellMoney.subtotalUSD,
-      totalPrice: sellMoney.totalUSD,
-      totalUSD: sellMoney.totalUSD,
-      totalSYP: sellMoney.totalSYP,
-      totalOriginal: sellMoney.totalOriginal,
-      paidUSD: sellMoney.paidUSD,
-      paidSYP: sellMoney.paidSYP,
-      paidOriginal: sellMoney.paidOriginal,
-      remainingDebt: sellMoney.remainingUSD,
-      remainingUSD: sellMoney.remainingUSD,
-      remainingSYP: sellMoney.remainingSYP,
-      remainingOriginal: sellMoney.remainingOriginal,
-      exchangeRate: sellMoney.exchangeRate,
-      amount_base: sellMoney.totalOriginal,
-      partValue: sellMoney.paidOriginal,
+      currency: sellMoney.currency,
+      subtotal: sellMoney.subtotal,
+      totalPrice: sellMoney.totalPrice,
+      paidAmount: sellMoney.paidAmount,
+      remainingDebt: sellMoney.remainingDebt,
+      amount: sellMoney.totalPrice,
+      partValue: sellMoney.paidAmount,
       discountType: sellMoney.discountType,
       discountPercent: sellMoney.discountPercent,
-      discountPercentUSD: sellMoney.discountPercentUSD,
-      discountAmountUSD: sellMoney.discountAmountUSD,
-      discountUSD: sellMoney.discountUSD,
-      discountSYP: sellMoney.discountSYP,
-      discountOriginal: sellMoney.discountOriginal,
-      discount: sellMoney.discountUSD,
+      discountPercentAmount: sellMoney.discountPercentAmount,
+      discountAmount: sellMoney.discountAmount,
+      discount: sellMoney.discount,
     };
-
     const stockUpdatedProducts: sell["products"] = [];
-
     if (!stockUpdater) {
       for (const product of productsForSell) {
         await updateQuantityOnSell(
@@ -1038,9 +688,7 @@ export const handleSell = async ({
         stockUpdatedProducts.push(product);
       }
     }
-
     let sellData: sell;
-
     try {
       sellData = await createSellInternal(sellToStore);
     } catch (createError) {
@@ -1061,49 +709,35 @@ export const handleSell = async ({
             ),
         );
       }
-
       throw createError;
     }
-
     if (stockUpdater) {
       for (const product of productsForSell) {
         await stockUpdater(product);
       }
     }
-
     await updateCustomerInternal(sellData.customerId, sellData);
     const sellLedgerEntries: LedgerEntry[] = [
       {
         accountId: sellData.paymentAccountId,
         entryType: "debit",
         amount: paidAmount,
-        currency: sellMoney.paymentCurrency,
-        exchangeRate: sellMoney.exchangeRate,
-        amountOriginal: sellMoney.paidOriginal,
-        amountSYP: sellMoney.paidSYP,
+        currency: sellMoney.currency,
       },
       {
         accountId: sellData.receivableAccountId,
         entryType: "debit",
         amount: sellData.remainingDebt,
-        currency: sellMoney.paymentCurrency,
-        exchangeRate: sellMoney.exchangeRate,
-        amountOriginal: sellMoney.remainingOriginal,
-        amountSYP: sellMoney.remainingSYP,
+        currency: sellMoney.currency,
       },
       {
         accountId: sellData.salesAccountId,
         entryType: "credit",
         amount: sellData.totalPrice,
-        currency: sellMoney.paymentCurrency,
-        exchangeRate: sellMoney.exchangeRate,
-        amountOriginal: sellMoney.totalOriginal,
-        amountSYP: sellMoney.totalSYP,
+        currency: sellMoney.currency,
       },
     ];
-
     await postLedgerEntries(sellLedgerEntries);
-
     await createJournalEntryInternal({
       date: sellData.date,
       description: `قيد بيع ${sellData.products?.[0]?.name || sellData.id}`,
@@ -1111,91 +745,114 @@ export const handleSell = async ({
       referenceId: sellData.id,
       lines: toJournalLines(
         sellLedgerEntries,
-        `قيد بيع ${sellData.products?.[0]?.name || sellData.id}`
+        `قيد بيع ${sellData.products?.[0]?.name || sellData.id}`,
       ),
     });
-
     if (sellData.remainingDebt === 0) {
       await createPaymentInternal({
         type: "income",
         customerId: sellData.customerId,
         sellId: sellData.id,
-        ...(sellData.driverId ? { collectorId: sellData.driverId, vehicleId: sellData.vehicleId } : {}),
+        ...(sellData.driverId
+          ? { collectorId: sellData.driverId, vehicleId: sellData.vehicleId }
+          : {}),
         paymentAccountId: sellData.paymentAccountId,
         receivableAccountId: sellData.receivableAccountId,
         salesAccountId: sellData.salesAccountId,
-        amount: sellData.paidUSD ?? sellData.totalPrice,
-        amountUSD: sellData.paidUSD ?? sellData.totalPrice,
-        amountSYP: sellData.paidSYP ?? 0,
-        amountOriginal: sellData.paidOriginal ?? sellData.totalPrice,
+        amount: sellData.paidAmount ?? sellData.totalPrice,
         note: "دفع كامل ثمن بيع",
         currency: sellData.currency,
-        paymentCurrency: sellData.paymentCurrency,
-        exchangeRate: sellData.exchangeRate,
-        amount_base: sellData.paidOriginal ?? sellData.amount_base,
       });
     } else if (sellData.remainingDebt < sellData.totalPrice) {
       await createPaymentInternal({
         type: "income",
         customerId: sellData.customerId,
         sellId: sellData.id,
-        ...(sellData.driverId ? { collectorId: sellData.driverId, vehicleId: sellData.vehicleId } : {}),
+        ...(sellData.driverId
+          ? { collectorId: sellData.driverId, vehicleId: sellData.vehicleId }
+          : {}),
         paymentAccountId: sellData.paymentAccountId,
         receivableAccountId: sellData.receivableAccountId,
         salesAccountId: sellData.salesAccountId,
         amount: paidAmount,
-        amountUSD: paidAmount,
-        amountSYP: sellData.paidSYP ?? 0,
-        amountOriginal: sellData.paidOriginal ?? paidAmount,
         note: "دفعة من ثمن بيع",
         currency: sellData.currency,
-        paymentCurrency: sellData.paymentCurrency,
-        exchangeRate: sellData.exchangeRate,
-        amount_base: sellData.paidOriginal ?? sellData.partValue ?? paidAmount,
       });
     }
-
     return sellData;
   } catch (err) {
     console.log(err);
     throw err;
   }
 };
-
-const settleCashPartyAtomic = async (paymentData: Payment, partyType: "customer" | "supplier") => {
-  if (partyType === "customer" ? !paymentData.customerId || paymentData.supplierId : !paymentData.supplierId || paymentData.customerId) throw new Error("نوع الطرف لا يطابق مسار الدفعة");
+const settleCashPartyAtomic = async (
+  paymentData: Payment,
+  partyType: "customer" | "supplier",
+) => {
+  if (
+    partyType === "customer"
+      ? !paymentData.customerId || paymentData.supplierId
+      : !paymentData.supplierId || paymentData.customerId
+  )
+    throw new Error("نوع الطرف لا يطابق مسار الدفعة");
   const now = new Date().toISOString();
   const normalized = normalizeCashPaymentMoney(paymentData);
   const payment: Payment = {
-    ...normalized, id: randomUUID(), date: now, settlementMethod: "cash", collectionSource: "management",
-    commissionRate: 0, commissionUSD: 0, commissionOriginal: 0,
+    ...normalized,
+    id: randomUUID(),
+    date: now,
+    settlementMethod: "cash",
+    collectionSource: "management",
+    commissionRate: 0,
+    commissionAmount: 0,
   };
   const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-  const request = payment.requestId ? {
-    requestKey: `cash_${hash(`${payment.createdBy || ""}:${payment.requestId}`)}`,
-    fingerprint: hash(JSON.stringify({ partyType, customerId: payment.customerId, supplierId: payment.supplierId,
-      sellId: payment.sellId, purchaseId: payment.purchaseId, paymentAccountId: payment.paymentAccountId,
-      receivableAccountId: payment.receivableAccountId, payableAccountId: payment.payableAccountId,
-      currency: payment.currency, exchangeRate: payment.exchangeRate, amountOriginal: payment.amountOriginal,
-      note: payment.note || "" })),
-  } : undefined;
+  const request = payment.requestId
+    ? {
+        requestKey: `cash_${hash(`${payment.createdBy || ""}:${payment.requestId}`)}`,
+        fingerprint: hash(
+          JSON.stringify({
+            partyType,
+            customerId: payment.customerId,
+            supplierId: payment.supplierId,
+            sellId: payment.sellId,
+            purchaseId: payment.purchaseId,
+            paymentAccountId: payment.paymentAccountId,
+            receivableAccountId: payment.receivableAccountId,
+            payableAccountId: payment.payableAccountId,
+            currency: payment.currency,
+            amount: payment.amount,
+            note: payment.note || "",
+          }),
+        ),
+      }
+    : undefined;
   const journalId = randomUUID();
   const rootRef = ref(database);
   const seed = await get(rootRef);
   if (!seed.exists()) throw new Error("بيانات المشروع غير متاحة");
   let output: ReturnType<typeof applyCashPartySettlement> | undefined;
-  const transaction = await runTransaction(rootRef, (current) => {
-    output = applyCashPartySettlement(current || seed.val(), payment, journalId, request);
-    return output.state;
-  }, { applyLocally: false });
+  const transaction = await runTransaction(
+    rootRef,
+    (current) => {
+      output = applyCashPartySettlement(
+        current || seed.val(),
+        payment,
+        journalId,
+        request,
+      );
+      return output.state;
+    },
+    { applyLocally: false },
+  );
   if (!transaction.committed || !output) throw new Error("تعذر تسجيل الدفعة");
   const { state: _state, ...result } = output;
   return result;
 };
-
-export const customerPayment = (paymentData: Payment) => settleCashPartyAtomic(paymentData, "customer");
-export const supplierPayment = (paymentData: Payment) => settleCashPartyAtomic(paymentData, "supplier");
-
+export const customerPayment = (paymentData: Payment) =>
+  settleCashPartyAtomic(paymentData, "customer");
+export const supplierPayment = (paymentData: Payment) =>
+  settleCashPartyAtomic(paymentData, "supplier");
 export const handleSupplierReturn = async (newReturn: {
   productCode: string;
   supplierId: string;
@@ -1213,44 +870,37 @@ export const handleSupplierReturn = async (newReturn: {
 }) => {
   const returnQty = Math.abs(Number(newReturn.qty || 0));
   const returnType = normalizePaymentStatus(newReturn.returnType);
-
   if (!returnQty) {
     throw new Error("Return quantity must be greater than zero");
   }
-
   if (returnType !== newReturn.returnType) {
     throw new Error("Invalid supplier return type");
   }
-
   const purchaseData = await getPurchaseByIdInternal(newReturn.referenceId);
   if (!purchaseData) {
     throw new Error("Purchase invoice was not found");
   }
-
   if (purchaseData.supplierId !== newReturn.supplierId) {
     throw new Error("Return supplier does not match the purchase invoice");
   }
-
   if (returnQty > toFiniteNumber(purchaseData.quantity)) {
     throw new Error("Return quantity is greater than purchase invoice quantity");
   }
-
   const returnValue = roundMoney(toFiniteNumber(newReturn.returnValue));
   if (returnValue <= 0) {
     throw new Error("Return value must be greater than zero");
   }
-
   const paymentAmount =
     returnType === "cash"
       ? returnValue
       : returnType === "part"
         ? roundMoney(Math.max(toFiniteNumber(newReturn.partValue), 0))
         : 0;
-
   if (returnType === "part" && (paymentAmount <= 0 || paymentAmount >= returnValue)) {
-    throw new Error("Partial supplier return amount must be greater than zero and less than return total");
+    throw new Error(
+      "Partial supplier return amount must be greater than zero and less than return total",
+    );
   }
-
   const payableReturnAmount = roundMoney(Math.max(returnValue - paymentAmount, 0));
   await Promise.all([
     assertAccountCanTransact(newReturn.inventoryAccountId, "Inventory"),
@@ -1261,27 +911,13 @@ export const handleSupplierReturn = async (newReturn: {
       ? assertAccountCanTransact(newReturn.payableAccountId, "Payable")
       : Promise.resolve(),
   ]);
-
-  const returnCurrency = normalizeCurrency(
-    purchaseData.paymentCurrency || purchaseData.currency,
-  );
-  const returnExchangeRate = normalizeExchangeRate(
-    returnCurrency,
-    purchaseData.exchangeRate,
-  );
-  const paymentOriginal = usdToOriginal(
-    paymentAmount,
-    returnCurrency,
-    returnExchangeRate,
-  );
-
+  const returnCurrency = normalizeCurrency(purchaseData.currency);
   await createReturnInternal({
     ...newReturn,
     qty: returnQty,
     returnValue,
     type: "purchase-return",
   });
-
   if (paymentAmount > 0) {
     await createPaymentInternal(
       stripUndefinedFields({
@@ -1290,92 +926,44 @@ export const handleSupplierReturn = async (newReturn: {
         paymentAccountId: newReturn.paymentAccountId,
         payableAccountId: newReturn.payableAccountId,
         amount: paymentAmount,
-        amountUSD: paymentAmount,
-        amountSYP: usdToSYPForPaymentCurrency(
-          paymentAmount,
-          returnCurrency,
-          returnExchangeRate,
-        ),
-        amountOriginal: paymentOriginal,
         note: `Supplier return (${newReturn.productCode})`,
         currency: returnCurrency,
-        paymentCurrency: returnCurrency,
-        exchangeRate: returnExchangeRate,
-        amount_base: paymentOriginal,
       }) as Payment,
     );
   }
-
   let balanceChange = 0;
   if (returnType === "debt") {
     balanceChange = -returnValue;
   } else if (returnType === "part") {
     balanceChange = -payableReturnAmount;
   }
-
-  const balanceSYPChange =
-    returnCurrency === "SYP"
-      ? usdToOriginal(balanceChange, returnCurrency, returnExchangeRate)
-      : 0;
-
+  const balanceSYPChange = roundMoney(balanceChange);
   await updateSupplierBalanceInternal(
     newReturn.supplierId,
     balanceChange,
     balanceSYPChange,
   );
-
   const supplierReturnLedgerEntries: LedgerEntry[] = [
     {
       accountId: newReturn.paymentAccountId,
       entryType: "debit",
       amount: paymentAmount,
       currency: returnCurrency,
-      exchangeRate: returnExchangeRate,
-      amountOriginal: paymentOriginal,
-      amountSYP: usdToSYPForPaymentCurrency(
-        paymentAmount,
-        returnCurrency,
-        returnExchangeRate,
-      ),
     },
     {
       accountId: newReturn.payableAccountId,
       entryType: "debit",
       amount: payableReturnAmount,
       currency: returnCurrency,
-      exchangeRate: returnExchangeRate,
-      amountOriginal: usdToOriginal(
-        payableReturnAmount,
-        returnCurrency,
-        returnExchangeRate,
-      ),
-      amountSYP: usdToSYPForPaymentCurrency(
-        payableReturnAmount,
-        returnCurrency,
-        returnExchangeRate,
-      ),
     },
     {
       accountId: newReturn.inventoryAccountId,
       entryType: "credit",
       amount: returnValue,
       currency: returnCurrency,
-      exchangeRate: returnExchangeRate,
-      amountOriginal: usdToOriginal(
-        returnValue,
-        returnCurrency,
-        returnExchangeRate,
-      ),
-      amountSYP: usdToSYPForPaymentCurrency(
-        returnValue,
-        returnCurrency,
-        returnExchangeRate,
-      ),
     },
   ];
-
   await postLedgerEntries(supplierReturnLedgerEntries);
-
   await createJournalEntryInternal({
     date: new Date().toISOString(),
     description: `Supplier return for purchase ${newReturn.referenceId}`,
@@ -1386,16 +974,12 @@ export const handleSupplierReturn = async (newReturn: {
       `Supplier return for purchase ${newReturn.referenceId}`,
     ),
   });
-
   const updatedQuantity = roundMoney(toFiniteNumber(purchaseData.quantity) - returnQty);
-
   await updatePurchaseInternal(newReturn.referenceId, {
     quantity: updatedQuantity,
   });
-
   return { success: true, message: "Supplier return completed successfully" };
 };
-
 export const handleCustomerReturn = async (newReturn: {
   productCode: string;
   products?: Array<{
@@ -1423,82 +1007,53 @@ export const handleCustomerReturn = async (newReturn: {
   if (!returnQty) {
     throw new Error("كمية الإرجاع غير صحيحة");
   }
-
   const returnableProduct = await getReturnableProductFromSellInternal(
     newReturn.referenceId,
     newReturn.productCode,
-    newReturn.warehouse
+    newReturn.warehouse,
   );
-
   if (!returnableProduct) {
     throw new Error("المنتج غير موجود في فاتورة البيع");
   }
-
   if (returnQty > returnableProduct.qty) {
     throw new Error("كمية الإرجاع أكبر من الكمية المتبقية في الفاتورة");
   }
-
-  const originalSellSnap = await get(
-    ref(database, `sells/${newReturn.referenceId}`),
-  );
+  const originalSellSnap = await get(ref(database, `sells/${newReturn.referenceId}`));
   const originalSell = originalSellSnap.exists()
     ? (originalSellSnap.val() as sell)
     : null;
-  const returnCurrency = normalizeCurrency(
-    originalSell?.paymentCurrency || originalSell?.currency,
-  );
-  const returnExchangeRate = normalizeExchangeRate(
-    returnCurrency,
-    originalSell?.exchangeRate,
-  );
+  const returnCurrency = normalizeCurrency(originalSell?.currency);
   const returnValue = returnQty * returnableProduct.sellPrice;
   const refundedCash =
     newReturn.returnType === "cash"
       ? returnValue
       : newReturn.returnType === "part"
-      ? newReturn.partValue
-      : 0;
-  const refundedOriginal = usdToOriginal(
-    refundedCash,
-    returnCurrency,
-    returnExchangeRate,
-  );
-
+        ? newReturn.partValue
+        : 0;
   await createReturnInternal({
     ...newReturn,
     qty: returnQty,
     returnValue,
     type: "sale-return",
   });
-
   if (refundedCash > 0) {
-    await createPaymentInternal(stripUndefinedFields({
-    type: "return",
-    customerId: newReturn.customerId,
-    paymentAccountId: newReturn.paymentAccountId,
-    receivableAccountId: newReturn.receivableAccountId,
-    salesAccountId: newReturn.salesAccountId,
-    amount:
-      -(newReturn.returnType === "cash"
-        ? returnValue
-        : newReturn.returnType === "part"
-        ? newReturn.partValue
-        : 0),
-    amountUSD: -refundedCash,
-    amountSYP: -usdToSYPForPaymentCurrency(
-      refundedCash,
-      returnCurrency,
-      returnExchangeRate,
-    ),
-    amountOriginal: -refundedOriginal,
-    note: `اعادة منتجات من الزبون (${newReturn.productCode} عدد ${newReturn.qty})`,
-    currency: returnCurrency,
-    paymentCurrency: returnCurrency,
-    exchangeRate: returnExchangeRate,
-    amount_base: -refundedOriginal,
-    }) as Payment);
+    await createPaymentInternal(
+      stripUndefinedFields({
+        type: "return",
+        customerId: newReturn.customerId,
+        paymentAccountId: newReturn.paymentAccountId,
+        receivableAccountId: newReturn.receivableAccountId,
+        salesAccountId: newReturn.salesAccountId,
+        amount: -(newReturn.returnType === "cash"
+          ? returnValue
+          : newReturn.returnType === "part"
+            ? newReturn.partValue
+            : 0),
+        note: `اعادة منتجات من الزبون (${newReturn.productCode} عدد ${newReturn.qty})`,
+        currency: returnCurrency,
+      }) as Payment,
+    );
   }
-
   const receivableReturnAmount = Math.max(returnValue - refundedCash, 0);
   await postLedgerEntries([
     {
@@ -1506,57 +1061,25 @@ export const handleCustomerReturn = async (newReturn: {
       entryType: "debit",
       amount: returnValue,
       currency: returnCurrency,
-      exchangeRate: returnExchangeRate,
-      amountOriginal: usdToOriginal(
-        returnValue,
-        returnCurrency,
-        returnExchangeRate,
-      ),
-      amountSYP: usdToSYPForPaymentCurrency(
-        returnValue,
-        returnCurrency,
-        returnExchangeRate,
-      ),
     },
     {
       accountId: newReturn.paymentAccountId,
       entryType: "credit",
       amount: refundedCash,
       currency: returnCurrency,
-      exchangeRate: returnExchangeRate,
-      amountOriginal: refundedOriginal,
-      amountSYP: usdToSYPForPaymentCurrency(
-        refundedCash,
-        returnCurrency,
-        returnExchangeRate,
-      ),
     },
     {
       accountId: newReturn.receivableAccountId,
       entryType: "credit",
       amount: receivableReturnAmount,
       currency: returnCurrency,
-      exchangeRate: returnExchangeRate,
-      amountOriginal: usdToOriginal(
-        receivableReturnAmount,
-        returnCurrency,
-        returnExchangeRate,
-      ),
-      amountSYP: usdToSYPForPaymentCurrency(
-        receivableReturnAmount,
-        returnCurrency,
-        returnExchangeRate,
-      ),
     },
   ]);
-
   if (newReturn.returnType === "debt") {
     const updatedCustomer = await updateCustomerBalanceInternal(
       newReturn.customerId,
       returnValue,
-      returnCurrency === "SYP"
-        ? usdToOriginal(returnValue, returnCurrency, returnExchangeRate)
-        : 0,
+      roundMoney(returnValue),
     );
     if (!updatedCustomer) {
       throw new Error("الزبون غير موجود لتحديث الرصيد");
@@ -1565,13 +1088,7 @@ export const handleCustomerReturn = async (newReturn: {
     const updatedCustomer = await updateCustomerBalanceInternal(
       newReturn.customerId,
       returnValue - newReturn.partValue,
-      returnCurrency === "SYP"
-        ? usdToOriginal(
-            returnValue - newReturn.partValue,
-            returnCurrency,
-            returnExchangeRate,
-          )
-        : 0,
+      roundMoney(returnValue - newReturn.partValue),
     );
     if (!updatedCustomer) {
       throw new Error("الزبون غير موجود لتحديث الرصيد");
@@ -1586,7 +1103,6 @@ export const handleCustomerReturn = async (newReturn: {
       throw new Error("الزبون غير موجود لتحديث الرصيد");
     }
   }
-
   await returnProductsFromSellInternal(newReturn.referenceId, [
     {
       code: newReturn.productCode,
@@ -1594,10 +1110,8 @@ export const handleCustomerReturn = async (newReturn: {
       qty: returnQty,
     },
   ]);
-
   return { success: true, message: "تمت عملية الإرجاع بنجاح" };
 };
-
 export const handleCustomerReturnSafe = async (newReturn: {
   productCode?: string;
   products?: Array<{
@@ -1643,80 +1157,77 @@ export const handleCustomerReturnSafe = async (newReturn: {
           qty: Number(newReturn.qty || 0),
         },
       ];
-
-  const originalSellSnap = await get(
-    ref(database, `sells/${newReturn.referenceId}`),
-  );
-
+  const originalSellSnap = await get(ref(database, `sells/${newReturn.referenceId}`));
   if (!originalSellSnap.exists()) {
     throw new Error("Sell invoice was not found");
   }
-
   const originalSell = originalSellSnap.val() as sell;
   if (originalSell.customerId !== newReturn.customerId) {
     throw new Error("Return customer does not match the sell invoice");
   }
-
   const calculation = calculateSaleReturn({
     sellData: originalSell,
     returnedProducts,
     returnType,
-    partValueUSD: newReturn.partValue,
+    partValueAmount: newReturn.partValue,
   });
-
   if (!newReturn.salesAccountId) {
     throw new Error("Sales account is required for customer returns");
   }
-
-  if (calculation.cashRefundUSD > 0 && !newReturn.paymentAccountId) {
+  if (calculation.cashRefundAmount > 0 && !newReturn.paymentAccountId) {
     throw new Error("Payment account is required for cash refunds");
   }
-
-  if (calculation.receivableCreditUSD > 0 && !newReturn.receivableAccountId) {
+  if (calculation.receivableCreditAmount > 0 && !newReturn.receivableAccountId) {
     throw new Error("Receivable account is required for debt return credits");
   }
-
   const assertAccountCanTransact = async (
     accountId: string | undefined,
     label: string,
   ) => {
     if (!accountId) return;
-
     const accountSnapshot = await get(ref(database, `accounts/${accountId}`));
     if (!accountSnapshot.exists()) {
       throw new Error(`${label} account was not found`);
     }
-
     const account = accountSnapshot.val();
     if (account?.allowTransactions === false) {
       throw new Error(`${label} account does not allow transactions`);
     }
   };
-
   await Promise.all([
     assertAccountCanTransact(newReturn.salesAccountId, "Sales"),
-    calculation.cashRefundUSD > 0
+    calculation.cashRefundAmount > 0
       ? assertAccountCanTransact(newReturn.paymentAccountId, "Payment")
       : Promise.resolve(),
-    calculation.receivableCreditUSD > 0
+    calculation.receivableCreditAmount > 0
       ? assertAccountCanTransact(newReturn.receivableAccountId, "Receivable")
       : Promise.resolve(),
   ]);
-
-  const customerSnapshot = await get(
-    ref(database, `customer/${newReturn.customerId}`),
-  );
+  const customerSnapshot = await get(ref(database, `customer/${newReturn.customerId}`));
   if (!customerSnapshot.exists()) {
     throw new Error("Customer was not found");
   }
-
   let allocatedReturnCredit = 0;
   let allocatedReturnCash = 0;
   for (const [index, returnedLine] of calculation.returnedLines.entries()) {
-    const originalLine = originalSell.products.find((product) => product.id === returnedLine.productId && product.warehouse === returnedLine.warehouse);
+    const originalLine = originalSell.products.find(
+      (product) =>
+        product.id === returnedLine.productId &&
+        product.warehouse === returnedLine.warehouse,
+    );
     const last = index === calculation.returnedLines.length - 1;
-    const credit = last ? roundMoney(calculation.receivableCreditUSD - allocatedReturnCredit) : roundMoney(calculation.receivableCreditUSD * returnedLine.netValueUSD / calculation.returnValueUSD);
-    const cash = last ? roundMoney(calculation.cashRefundUSD - allocatedReturnCash) : roundMoney(calculation.cashRefundUSD * returnedLine.netValueUSD / calculation.returnValueUSD);
+    const credit = last
+      ? roundMoney(calculation.receivableCreditAmount - allocatedReturnCredit)
+      : roundMoney(
+          (calculation.receivableCreditAmount * returnedLine.netValueAmount) /
+            calculation.returnValueAmount,
+        );
+    const cash = last
+      ? roundMoney(calculation.cashRefundAmount - allocatedReturnCash)
+      : roundMoney(
+          (calculation.cashRefundAmount * returnedLine.netValueAmount) /
+            calculation.returnValueAmount,
+        );
     allocatedReturnCredit = roundMoney(allocatedReturnCredit + credit);
     allocatedReturnCash = roundMoney(allocatedReturnCash + cash);
     await createReturnInternal({
@@ -1724,80 +1235,61 @@ export const handleCustomerReturnSafe = async (newReturn: {
       productId: returnedLine.productId,
       warehouse: returnedLine.warehouse,
       qty: returnedLine.qty,
-      returnValue: returnedLine.netValueUSD,
+      returnValue: returnedLine.netValueAmount,
       type: "sale-return",
       referenceId: newReturn.referenceId,
       reason: newReturn.reason || "",
       productName: originalLine?.name || "",
-      payPriceUSD: toMoneyNumber(originalLine?.payPrice),
-      sellPriceUSD: returnedLine.sellPrice,
+      payPriceAmount: toMoneyNumber(originalLine?.payPrice),
+      sellPriceAmount: returnedLine.sellPrice,
       ...(originalSell.driverId ? { driverId: originalSell.driverId } : {}),
       ...(originalSell.vehicleId ? { vehicleId: originalSell.vehicleId } : {}),
-      cashRefundUSD: cash,
-      receivableCreditUSD: credit,
-      currency: calculation.paymentCurrency,
-      exchangeRate: calculation.exchangeRate,
+      cashRefundAmount: cash,
+      receivableCreditAmount: credit,
+      currency: calculation.currency,
     });
   }
-
-  if (calculation.cashRefundUSD > 0) {
+  if (calculation.cashRefundAmount > 0) {
     const refunds = await prepareDriverRefundPayments(
-      newReturn.referenceId, calculation.cashRefundUSD,
-      calculation.paymentCurrency, calculation.exchangeRate, newReturn.refundPaidByDriverId,
+      newReturn.referenceId,
+      calculation.cashRefundAmount,
+      calculation.currency,
+      newReturn.refundPaidByDriverId,
     );
-    for (const refund of refunds) await createPaymentInternal(
-      stripUndefinedFields({
-        ...refund,
-        customerId: newReturn.customerId,
-        sellId: newReturn.referenceId,
-        paymentAccountId: newReturn.paymentAccountId,
-        receivableAccountId: newReturn.receivableAccountId,
-        salesAccountId: newReturn.salesAccountId,
-        note: `Customer return (${calculation.returnedLines.length} product line)`,
-      }) as Payment,
-    );
+    for (const refund of refunds)
+      await createPaymentInternal(
+        stripUndefinedFields({
+          ...refund,
+          customerId: newReturn.customerId,
+          sellId: newReturn.referenceId,
+          paymentAccountId: newReturn.paymentAccountId,
+          receivableAccountId: newReturn.receivableAccountId,
+          salesAccountId: newReturn.salesAccountId,
+          note: `Customer return (${calculation.returnedLines.length} product line)`,
+        }) as Payment,
+      );
   }
-
   const returnLedgerEntries: LedgerEntry[] = [
     {
       accountId: newReturn.salesAccountId,
       entryType: "debit",
-      amount: calculation.returnValueUSD,
-      currency: calculation.paymentCurrency,
-      exchangeRate: calculation.exchangeRate,
-      amountOriginal: usdToOriginal(
-        calculation.returnValueUSD,
-        calculation.paymentCurrency,
-        calculation.exchangeRate,
-      ),
-      amountSYP: usdToSYPForPaymentCurrency(
-        calculation.returnValueUSD,
-        calculation.paymentCurrency,
-        calculation.exchangeRate,
-      ),
+      amount: calculation.returnValueAmount,
+      currency: calculation.currency,
     },
     {
       accountId: newReturn.paymentAccountId,
       entryType: "credit",
-      amount: calculation.cashRefundUSD,
-      currency: calculation.paymentCurrency,
-      exchangeRate: calculation.exchangeRate,
-      amountOriginal: calculation.cashRefundOriginal,
-      amountSYP: calculation.cashRefundSYP,
+      amount: calculation.cashRefundAmount,
+      currency: calculation.currency,
     },
     {
       accountId: newReturn.receivableAccountId,
       entryType: "credit",
-      amount: calculation.receivableCreditUSD,
-      currency: calculation.paymentCurrency,
-      exchangeRate: calculation.exchangeRate,
-      amountOriginal: calculation.receivableCreditOriginal,
-      amountSYP: calculation.receivableCreditSYP,
+      amount: calculation.receivableCreditAmount,
+      currency: calculation.currency,
     },
   ];
-
   await postLedgerEntries(returnLedgerEntries);
-
   await createJournalEntryInternal({
     date: new Date().toISOString(),
     description: `Customer return for sell ${newReturn.referenceId}`,
@@ -1808,34 +1300,28 @@ export const handleCustomerReturnSafe = async (newReturn: {
       `Customer return for sell ${newReturn.referenceId}`,
     ),
   });
-
-  if (calculation.receivableCreditUSD > 0 || calculation.receivableCreditSYP > 0) {
+  if (calculation.receivableCreditAmount > 0 || calculation.receivableCreditSYP > 0) {
     await updateCustomerBalanceInternal(
       newReturn.customerId,
-      calculation.receivableCreditUSD,
+      calculation.receivableCreditAmount,
       calculation.receivableCreditSYP,
     );
   }
-
   await update(
     ref(database, `sells/${newReturn.referenceId}`),
     calculation.updatedSell,
   );
   await reconcileCustomerBalanceInternal(newReturn.customerId);
-
   return {
     success: true,
     message: "Customer return completed successfully",
     data: calculation,
   };
 };
-
 export const warehouseTransfer = async (transferData: {
   productId: string;
   oldWarehouse: string;
   newWarehouse: string;
-  exchangeRate: number;
-  amount_base: number;
   amount: number;
   currency: string;
   quantity: number;
@@ -1849,18 +1335,14 @@ export const warehouseTransfer = async (transferData: {
 }) => {
   try {
     const product = await getProductByIdInternal(transferData.productId);
-
     if (product?.message) {
       return product.message;
     }
-
     const currentStock = Number(product.product.quantity || 0);
     const stockAfter = currentStock - transferData.quantity;
-
     if (stockAfter < 0) {
       throw new Error("الكمية غير كافية في المستودع");
     }
-
     await createTransferInternal({
       productId: transferData.productId,
       code: product.product.code,
@@ -1873,117 +1355,67 @@ export const warehouseTransfer = async (transferData: {
       stockBefore: currentStock,
       stockAfter,
       fromProductId: transferData.productId,
-      unitCostUSD: Number(product.product.payPrice || 0),
+      unitCostAmount: Number(product.product.payPrice || 0),
       performedBy: "admin",
       referenceId: `TR-${Date.now()}`,
       note: transferData.note,
     });
-
     await updateQuantityOnSell(
       transferData.productId,
       transferData.oldWarehouse,
       transferData.quantity,
       product.product.code,
     );
-
     await createOrUpdateProductInternal({
       ...product.product,
       warehouse: transferData.newWarehouse,
       quantity: transferData.quantity,
       sellPrice: transferData.newSellPrice || product.product.sellPrice,
     });
-
     const transferCurrency = normalizeCurrency(transferData.currency);
-    const transferExchangeRate = normalizeExchangeRate(
-      transferCurrency,
-      transferData.exchangeRate,
-    );
     const transferAmountOriginal = Math.max(toFiniteNumber(transferData.amount), 0);
-    const transferAmountUSD = originalToUSD(
-      transferAmountOriginal,
-      transferCurrency,
-      transferExchangeRate,
-    );
-
-    if (transferAmountUSD > 0) {
+    const transferAmountAmount = roundMoney(transferAmountOriginal);
+    if (transferAmountAmount > 0) {
       const paymentStatus = transferData.paymentStatus || "cash";
       const paidOriginal =
         paymentStatus === "cash"
           ? transferAmountOriginal
           : paymentStatus === "part"
-          ? Number(transferData.partValue || 0)
-          : 0;
-      const paidAmount = originalToUSD(
-        paidOriginal,
-        transferCurrency,
-        transferExchangeRate,
-      );
-      const payableAmount = Math.max(transferAmountUSD - paidAmount, 0);
-      const payableOriginal = Math.max(transferAmountOriginal - paidOriginal, 0);
-
+            ? Number(transferData.partValue || 0)
+            : 0;
+      const paidAmount = roundMoney(paidOriginal);
+      const payableAmount = Math.max(transferAmountAmount - paidAmount, 0);
       if (paidAmount > 0) {
         await createPaymentInternal({
-        type: "expense",
-        supplierId: "transfer",
-        expenseAccountId: transferData.expenseAccountId,
-        paymentAccountId: transferData.paymentAccountId,
-        currency: transferCurrency,
-        paymentCurrency: transferCurrency,
-        exchangeRate: transferExchangeRate,
-        amount_base: -paidOriginal,
-        amount: Number(-paidAmount),
-        amountUSD: -paidAmount,
-        amountSYP: -usdToSYPForPaymentCurrency(
-          paidAmount,
-          transferCurrency,
-          transferExchangeRate,
-        ),
-        amountOriginal: -paidOriginal,
-        note:
-          `نقل ${product.product.name} // ${transferData.note}` ||
-          `Transfer: ${product.product.name || transferData.productId}`,
+          type: "expense",
+          supplierId: "transfer",
+          expenseAccountId: transferData.expenseAccountId,
+          paymentAccountId: transferData.paymentAccountId,
+          currency: transferCurrency,
+          amount: -paidOriginal,
+          note:
+            `نقل ${product.product.name} // ${transferData.note}` ||
+            `Transfer: ${product.product.name || transferData.productId}`,
         });
       }
-
       await postLedgerEntries([
         {
           accountId: transferData.expenseAccountId,
           entryType: "debit",
-          amount: transferAmountUSD,
+          amount: transferAmountAmount,
           currency: transferCurrency,
-          exchangeRate: transferExchangeRate,
-          amountOriginal: transferAmountOriginal,
-          amountSYP: usdToSYPForPaymentCurrency(
-            transferAmountUSD,
-            transferCurrency,
-            transferExchangeRate,
-          ),
         },
         {
           accountId: transferData.paymentAccountId,
           entryType: "credit",
           amount: paidAmount,
           currency: transferCurrency,
-          exchangeRate: transferExchangeRate,
-          amountOriginal: paidOriginal,
-          amountSYP: usdToSYPForPaymentCurrency(
-            paidAmount,
-            transferCurrency,
-            transferExchangeRate,
-          ),
         },
         {
           accountId: transferData.payableAccountId,
           entryType: "credit",
           amount: payableAmount,
           currency: transferCurrency,
-          exchangeRate: transferExchangeRate,
-          amountOriginal: payableOriginal,
-          amountSYP: usdToSYPForPaymentCurrency(
-            payableAmount,
-            transferCurrency,
-            transferExchangeRate,
-          ),
         },
       ]);
     }

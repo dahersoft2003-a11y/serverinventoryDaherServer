@@ -1,5 +1,4 @@
 import type { SupportedCurrency } from "../utils/money";
-
 export interface CommissionRateChange {
   id: string;
   rate: number;
@@ -7,7 +6,6 @@ export interface CommissionRateChange {
   createdAt: string;
   createdBy: string;
 }
-
 export interface DriverSummary {
   id: string;
   username: string;
@@ -17,15 +15,13 @@ export interface DriverSummary {
   vehicleId?: string;
   vehicleName?: string;
 }
-
 export interface DriverStockItem {
   productId: string;
   productName: string;
   code: string;
   quantity: number;
-  costUSD: number;
+  costAmount: number;
 }
-
 export interface DriverMovement {
   id: string;
   requestId: string;
@@ -35,22 +31,19 @@ export interface DriverMovement {
   type: "remittance" | "commission_payout" | "advance" | "expense" | "opening";
   date: string;
   currency: SupportedCurrency;
-  exchangeRate: number;
-  amountOriginal: number;
-  amountUSD: number;
+  amount: number;
   payoutSource?: "driver_cash" | "treasury";
   sourceAccountId?: string;
   destinationAccountId?: string;
   expenseAccountId?: string;
   openingCashOriginal?: number;
-  openingCommissionUSD?: number;
+  openingCommissionAmount?: number;
   stock?: DriverStockItem[];
   note: string;
   createdBy: string;
   createdAt: string;
   journalEntryId?: string;
 }
-
 export interface DriverCollection {
   id: string;
   date: string;
@@ -61,12 +54,9 @@ export interface DriverCollection {
   driverName: string;
   vehicleId?: string;
   currency: SupportedCurrency;
-  exchangeRate: number;
-  amountOriginal: number;
-  amountUSD: number;
+  amount: number;
   commissionRate: number | null;
-  commissionUSD: number;
-  commissionOriginal: number;
+  commissionAmount: number;
   isRefund: boolean;
   originalPaymentId?: string;
   collectionSource: string;
@@ -74,7 +64,6 @@ export interface DriverCollection {
   settlementMethod: string;
   note: string;
 }
-
 export interface DriverCashRow {
   driverId?: string;
   driverName?: string;
@@ -84,14 +73,11 @@ export interface DriverCashRow {
   date: string;
   type: string;
   currency: SupportedCurrency;
-  exchangeRate: number;
-  amountOriginal: number;
-  amountUSD: number;
-  balanceUSD: number;
+  amount: number;
+  balance: number;
   balanceByCurrency: Record<SupportedCurrency, number>;
   note: string;
 }
-
 export interface DriverCommissionRow {
   driverId?: string;
   driverName?: string;
@@ -101,11 +87,10 @@ export interface DriverCommissionRow {
   date: string;
   type: string;
   rate: number | null;
-  basisUSD: number;
-  amountUSD: number;
-  balanceUSD: number;
+  basisAmount: number;
+  amount: number;
+  balance: number;
 }
-
 export interface DriverStockRow {
   driverId?: string;
   driverName?: string;
@@ -119,10 +104,9 @@ export interface DriverStockRow {
   productName: string;
   code: string;
   quantity: number;
-  costUSD: number;
+  costAmount: number;
   balance: number;
 }
-
 export interface DriverStockBalance {
   driverId?: string;
   driverName?: string;
@@ -134,9 +118,8 @@ export interface DriverStockBalance {
   incomingQuantity: number;
   outgoingQuantity: number;
   closingQuantity: number;
-  costUSD: number;
+  costAmount: number;
 }
-
 export interface DriverSale {
   driverId: string;
   driverName: string;
@@ -147,48 +130,64 @@ export interface DriverSale {
   vehicleId?: string;
   vehicleName?: string;
   currency: string;
-  exchangeRate: number;
-  grossUSD: number;
-  discountUSD: number;
-  netUSD: number;
-  costUSD: number;
-  profitUSD: number;
-  returnsUSD: number;
-  remainingDebtUSD: number;
+  grossAmount: number;
+  discount: number;
+  netAmount: number;
+  costAmount: number;
+  profitAmount: number;
+  returnsAmount: number;
+  remainingDebtAmount: number;
   paymentAccountId?: string;
   receivableAccountId?: string;
-  products: Array<{ id: string; code: string; name: string; qty: number; payPrice: number; sellPrice: number; warehouse: string }>;
+  products: Array<{
+    id: string;
+    code: string;
+    name: string;
+    qty: number;
+    payPrice: number;
+    sellPrice: number;
+    warehouse: string;
+  }>;
   paymentStatus: string;
 }
-
 export interface DriverStatement {
   driver: DriverSummary | null;
   drivers: DriverSummary[];
-  vehicles: Array<{ id: string; name: string; driverId?: string; driverName?: string }>;
-  filters: { driverId: string; dateFrom: string; dateTo: string; vehicleId: string };
+  vehicles: Array<{
+    id: string;
+    name: string;
+    driverId?: string;
+    driverName?: string;
+  }>;
+  filters: {
+    driverId: string;
+    dateFrom: string;
+    dateTo: string;
+    vehicleId: string;
+  };
   summary: {
     salesCount: number;
-    salesGrossUSD: number;
-    discountsUSD: number;
-    salesNetUSD: number;
-    costUSD: number;
-    profitUSD: number;
-    returnsUSD: number;
-    outstandingDebtUSD: number;
-    cashOpeningUSD: number;
-    cashClosingUSD: number;
+    salesGrossAmount: number;
+    discountsAmount: number;
+    salesNetAmount: number;
+    costAmount: number;
+    profitAmount: number;
+    returnsAmount: number;
+    outstandingDebtAmount: number;
+    cashOpeningAmount: number;
+    cashClosingAmount: number;
     cashOpeningByCurrency: Record<SupportedCurrency, number>;
     cashClosingByCurrency: Record<SupportedCurrency, number>;
-    collectionsUSD: number;
-    remittancesUSD: number;
-    advancesUSD: number;
-    expensesUSD: number;
-    refundedUSD: number;
-    commissionEarnedUSD: number;
-    commissionPaidUSD: number;
-    commissionOpeningUSD: number;
-    commissionClosingUSD: number;
-    unknownCollectionsUSD: number;
+    collectionsAmount: number;
+    remittancesAmount: number;
+    advancesAmount: number;
+    expensesAmount: number;
+    refundedAmount: number;
+    commissionEarnedAmount: number;
+    commissionPaidAmount: number;
+    commissionOpeningAmount: number;
+    commissionClosingAmount: number;
+    unknownCollectionsAmount: number;
   };
   sales: DriverSale[];
   outstandingInvoices: DriverSale[];
@@ -197,9 +196,49 @@ export interface DriverStatement {
   commissionRows: DriverCommissionRow[];
   stockMovements: DriverStockRow[];
   stockBalances: DriverStockBalance[];
-  returns: Array<{ id: string; date: string; sellId: string; driverId: string; driverName: string; customerName: string; productName: string; code: string; qty: number; returnValue: number; cashRefundUSD: number; receivableCreditUSD: number }>;
-  settlements: Array<{ id: string; date: string; sellId?: string; driverId: string; driverName: string; customerName: string; goodsDirection: string; amountUSD: number; items: Array<{ productId: string; name: string; code: string; quantity: number; settlementPriceUSD: number; lineTotalUSD: number }> }>;
-  currentStock: { asOf: string; products: Array<DriverStockItem & { vehicleId: string; warehouse: string }>; quantity: number; costUSD: number };
+  returns: Array<{
+    id: string;
+    date: string;
+    sellId: string;
+    driverId: string;
+    driverName: string;
+    customerName: string;
+    productName: string;
+    code: string;
+    qty: number;
+    returnValue: number;
+    cashRefundAmount: number;
+    receivableCreditAmount: number;
+  }>;
+  settlements: Array<{
+    id: string;
+    date: string;
+    sellId?: string;
+    driverId: string;
+    driverName: string;
+    customerName: string;
+    goodsDirection: string;
+    amount: number;
+    items: Array<{
+      productId: string;
+      name: string;
+      code: string;
+      quantity: number;
+      settlementPriceAmount: number;
+      lineTotalAmount: number;
+    }>;
+  }>;
+  currentStock: {
+    asOf: string;
+    products: Array<
+      DriverStockItem & {
+        vehicleId: string;
+        warehouse: string;
+      }
+    >;
+    quantity: number;
+    costAmount: number;
+  };
   generatedAt: string;
   warnings: string[];
 }

@@ -3,6 +3,11 @@
   "version": "1.0.0",
   "main": "src/server.ts",
   "scripts": {
+    "test": "npm run build && node --test tests/*.test.js",
+    "money:preview": "node scripts/syp-migration.cjs preview",
+    "money:prepare": "node scripts/syp-migration.cjs prepare",
+    "money:export": "node scripts/export-syp-source.cjs",
+    "money:cutover": "node scripts/apply-syp-migration.cjs",
     "start": "node dist/server.js",
     "build": "tsc",
     "dev": "nodemon src/server.ts",
